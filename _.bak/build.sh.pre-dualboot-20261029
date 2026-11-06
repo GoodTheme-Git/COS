@@ -1,0 +1,152 @@
+#!/bin/bash
+# Build the bootable COS image: a hybrid ISO that boots from BIOS, 64-bit
+# EFI and 32-bit EFI, from a CD or written straight to a USB stick. It runs
+# COS live, and has a menu entry that installs COS onto a hard disk.
+#
+#   ./build.sh              build out/cos-<version>.iso
+#   ./build.sh --test       build, then boot it in QEMU (BIOS and EFI)
+#
+# No root needed: mmdebstrap builds the Debian system in a user namespace.
+# Base: Debian 12 "bookworm", 32-bit (i386) userland with BOTH a 32-bit
+# (686) and a 64-bit (amd64) kernel, so one image runs on a 2006 Core Duo
+# and a modern PC alike; GRUB picks the kernel by asking the CPU.
+set -euo pipefail
+umask 022
+HERE=$(cd "$(dirname "$0")" && pwd)
+COS=$(dirname "$HERE")
+WORK=${WORK:-$HERE/work}
+CACHE=${CACHE:-$HERE/cache}      # downloaded .debs, so a rebuild is quick
+OUT=${OUT:-$HERE/out}
+SUITE=bookworm
+MIRROR=${MIRROR:-http://deb.debian.org/debian}
+COMPONENTS="main contrib non-free non-free-firmware"
+# The host's keyring (2023) verifies bookworm main/updates via the bookworm
+# release key. Security updates are signed only by newer keys, so they are
+# applied inside the new system once Debian's own keyring package is there
+# (see customize.sh) -- verified through the same chain, never unsigned.
+KEYRING=/usr/share/keyrings/debian-archive-keyring.gpg
+[ -f "$KEYRING" ] || { echo "missing $KEYRING (sudo apt install debian-archive-keyring)"; exit 1; }
+VERSION=$(sed -n "s/^VERSION = '\(.*\)'/\1/p" "$COS/cos.py" | head -1)
+
+PKGS=(
+  # system
+  systemd-sysv libpam-systemd dbus udev kmod sudo less nano ca-certificates
+  debian-archive-keyring
+  pciutils usbutils
+  # commands COS runs: ps/top/free, ip/ss, file, column
+  procps iproute2 file bsdextrautils
+  # both kernels; live-boot makes the squashfs bootable from USB
+  # (the 64-bit kernel comes from the amd64 archive via multiarch: Debian 12
+  # no longer builds it for i386, and it runs the 32-bit system natively)
+  linux-image-686 linux-image-amd64:amd64 live-boot
+  # what COS uses: python, ffmpeg/ffplay for media + the boot animation,
+  # alsa for sound, console fonts for graphics mode
+  python3 ffmpeg alsa-utils console-setup kbd
+  # drive letters: mounting C: (Windows), L: (Linux), M: (Mac), USB sticks
+  udisks2 polkitd ntfs-3g exfatprogs
+  # networking (nmtui for wifi from a console)
+  network-manager wpasupplicant iw
+  # fetching things: Pigeon pulls (curl ... /pull | python3 -), downloads
+  curl wget
+  # firmware a 2006 laptop is likely to need (Intel/Atheros/Broadcom/
+  # Realtek wifi, ATI graphics)
+  firmware-linux-free firmware-misc-nonfree firmware-iwlwifi firmware-ipw2x00
+  firmware-atheros firmware-brcm80211 firmware-realtek firmware-amd-graphics
+  # the disk installer
+  whiptail parted dosfstools e2fsprogs squashfs-tools
+  grub2-common grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin
+)
+
+missing=()
+for t in mmdebstrap grub-mkrescue xorriso mksquashfs mformat newuidmap; do
+    command -v "$t" >/dev/null || missing+=("$t")
+done
+[ -d /usr/lib/grub/i386-pc ] || missing+=(grub-pc-bin)
+[ -d /usr/lib/grub/x86_64-efi ] || missing+=(grub-efi-amd64-bin)
+if [ ${#missing[@]} -gt 0 ]; then
+    echo "missing: ${missing[*]}"
+    echo "sudo apt install mmdebstrap debian-archive-keyring xorriso mtools squashfs-tools grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin uidmap"
+    exit 1
+fi
+[ -d /usr/lib/grub/i386-efi ] || echo "note: grub-efi-ia32-bin not installed; the ISO will not boot on 32-bit EFI"
+
+rm -rf "$WORK"
+mkdir -p "$WORK/iso/live" "$WORK/iso/boot/grub" "$WORK/bootout" "$OUT" "$CACHE"
+cp "$HERE/grub.cfg" "$WORK/iso/boot/grub/grub.cfg"
+
+# Everything that goes into the system is staged in one tree and synced in
+# by mmdebstrap as us: its hooks run as a namespaced root that cannot read
+# a home directory, so they never touch host paths themselves.
+STAGE="$WORK/stage"
+mkdir -p "$STAGE/opt/cos/pkgs" "$STAGE/root"
+cp -a "$HERE/overlay/." "$STAGE/"
+cp "$COS/cos.py" "$COS/cos_setup.py" "$COS/ibbs.py" "$STAGE/opt/cos/"
+cp -r "$COS/cosStartSeq" "$COS/sounds" "$STAGE/opt/cos/"
+[ -f "$COS/installermusic.wav" ] && cp "$COS/installermusic.wav" "$STAGE/opt/cos/"
+cp "$COS"/pkgs/*.cip "$COS"/pkgs/*.cdi "$STAGE/opt/cos/pkgs/" 2>/dev/null || true
+cp "$HERE/customize.sh" "$STAGE/root/cos-customize.sh"
+# sync-in unpacks this as a tar, so every directory in it -- '/', /etc, /usr
+# included -- takes the stage's owner and mode. Record each path so the
+# customize step can hand them all back to root, not group-writable.
+chmod -R u+rwX,go+rX,go-w "$STAGE"
+(cd "$STAGE" && find . -mindepth 0 | sed 's#^\.##; s#^$#/#') > "$STAGE/root/cos-stage.list"
+
+echo "== building the COS system (Debian $SUITE i386) -- downloads ~400 MB the first time"
+mmdebstrap --mode=unshare --architectures=i386,amd64 --variant=minbase \
+    --include="$(IFS=,; echo "${PKGS[*]}")" \
+    --skip=download/empty \
+    --setup-hook='mkdir -p "$1/var/cache/apt/archives"' \
+    --setup-hook="sync-in $CACHE /var/cache/apt/archives/" \
+    --essential-hook='echo "firmware-ipw2x00 firmware-ipw2x00/license/accepted boolean true" | chroot "$1" debconf-set-selections' \
+    --customize-hook="sync-out /var/cache/apt/archives $CACHE" \
+    --customize-hook="sync-in $STAGE /" \
+    --customize-hook='chroot "$1" bash /root/cos-customize.sh' \
+    --customize-hook="sync-out /boot $WORK/bootout" \
+    "$SUITE" "$WORK/rootfs.tar" \
+    "deb [signed-by=$KEYRING] $MIRROR $SUITE $COMPONENTS" \
+    "deb [signed-by=$KEYRING] $MIRROR $SUITE-updates $COMPONENTS"
+
+# kernels and initramfs for the boot menu (live-boot is in these initrds)
+for k in 686 amd64; do
+    cp "$(ls "$WORK"/bootout/vmlinuz-*-$k | sort -V | tail -1)" "$WORK/iso/live/vmlinuz-$k"
+    cp "$(ls "$WORK"/bootout/initrd.img-*-$k | sort -V | tail -1)" "$WORK/iso/live/initrd-$k"
+done
+
+# mmdebstrap writes a tar; mksquashfs (4.6+) reads it directly, keeping the
+# root ownership the tar records -- no squashfs-tools-ng needed.
+echo "== compressing the system into the live image"
+mksquashfs - "$WORK/iso/live/filesystem.squashfs" -tar -comp xz -b 1M \
+    -noappend -quiet < "$WORK/rootfs.tar"
+# unpacked size, for the disk installer's progress bar
+stat -c %s "$WORK/rootfs.tar" > "$WORK/iso/live/filesystem.size"
+rm -f "$WORK/rootfs.tar"
+
+for k in 686 amd64; do
+    [ -s "$WORK/iso/live/vmlinuz-$k" ] && [ -s "$WORK/iso/live/initrd-$k" ] \
+        || { echo "kernel $k missing from the build"; exit 1; }
+done
+
+# The stick's own System folder: anything in iso-extra/ goes on the stick
+# as-is, and System/Library/CURL_and_WGET also gets curl and wget's packages
+# with every library they need (installable offline: dpkg -i *.deb).
+echo "== filling System/Library on the stick"
+cp -r "$HERE/iso-extra/." "$WORK/iso/"
+python3 "$HERE/system-library.py" "$CACHE" \
+    "$WORK/iso/System/Library/CURL_and_WGET" i386 curl wget
+
+echo "== making the hybrid BIOS/EFI image"
+ISO="$OUT/cos-$VERSION.iso"
+# xorriso-mbr.py lays the stick out the way old BIOSes want it: an MBR with
+# an active partition plus an EFI partition, not GRUB's default GPT, which a
+# 2006 BIOS can reset on before GRUB even loads
+MKRESCUE=(grub-mkrescue --xorriso="$HERE/xorriso-mbr.py" -o "$ISO" "$WORK/iso" -- -volid COS_LIVE)
+"${MKRESCUE[@]}" >/dev/null 2>&1 || "${MKRESCUE[@]}"
+sha256sum "$ISO" | tee "$ISO.sha256"
+ls -lh "$ISO"
+echo
+echo "Write it to a USB stick (ERASES the stick -- check the device name!):"
+echo "    sudo dd if=$ISO of=/dev/sdX bs=4M status=progress conv=fsync"
+
+if [ "${1:-}" = "--test" ]; then
+    python3 "$HERE/vmtest.py" live "$ISO"
+fi
