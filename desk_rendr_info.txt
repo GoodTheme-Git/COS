@@ -1,0 +1,168 @@
+================================================================================
+  COS -- DESKTOP RENDERING                                      BETA
+  CONTROL > Preferences > BETA > Desktop rendering
+================================================================================
+
+THE TWO MODES
+
+  Text mode  (regular COS rendering)
+
+      What COS has always done. curses draws character cells, the kernel's
+      console driver (fbcon) turns those cells into pixels using whatever
+      console font is loaded, and that is what reaches the panel.
+
+      Eight colours, 256 glyphs, one cell size. It works on anything that
+      can run a terminal -- a real VT, an SSH session, a terminal window
+      inside GNOME or KDE -- and it is the mode to stay in if you are not
+      sitting at the machine itself.
+
+  Graphics mode  (render desktop live)
+
+      COS paints the desktop as actual pixels. It takes the console into
+      KD_GRAPHICS so fbcon stops drawing, becomes DRM master on the display
+      controller, allocates a framebuffer at the panel's own preferred mode,
+      and blits every cell itself out of a console font it loads directly.
+
+      The desktop above it does not change at all. Windows still draw into
+      curses exactly as they always have; graphics mode reads the finished
+      screen back and presents it. It is a presentation layer, not a second
+      user interface, which is why every app keeps working.
+
+
+WHAT GRAPHICS MODE IS FOR
+
+  24-bit colour.    The console gives eight colours and a bold bit. A DRM
+                    framebuffer gives all of them. The theme colours are the
+                    same for now, but nothing is clamped to eight any more.
+
+  Real pixels.      A window can hand over a rectangle of true RGB instead
+                    of character cells. A photograph becomes a photograph
+                    rather than 8160 cells pretending to be one through the
+                    1120-tone trick AsciiPic uses. ("Let windows draw true
+                    pixels" is the switch for this.)
+
+  The panel's own resolution. 1366x768 here, instead of whatever grid the
+                    console font happens to give.
+
+  It is NOT faster than text mode, and it is not meant to be. Text mode is
+  the kernel doing the work; graphics mode is COS doing it in Python.
+  Measured on this machine, 170x48 cells at 8x16:
+
+      first frame after a mode set   ~70 ms   (every cell)
+      a frame where nothing moved    ~5 ms    (reads the screen, blits none)
+      a frame where a window moved   ~7 ms    (366 cells)
+
+  Only the cells that actually changed are repainted. That is the whole
+  reason it is usable: a desktop at rest changes the clock and the pointer.
+
+
+WHY CHANGING IT RESTARTS COS
+
+  Graphics mode owns two things that cannot be handed over politely while a
+  desktop is running on top of them: the console (KD_GRAPHICS, which decides
+  whether fbcon is painting) and the CRTC (which decides what the panel is
+  scanning out).
+
+  Taking those halfway through a running session is exactly the kind of
+  half-state that ends in a black screen with no way to say so. So the
+  switch is a restart, deliberately. Settings are saved first; open windows
+  and anything unsaved in the editor are lost, the same as any restart.
+
+
+IF THE SCREEN GOES BLACK
+
+  This is the one feature in COS that can leave you with nothing to look at,
+  so there are three ways out, in the order they will happen to you:
+
+  1. COS undoes it by itself.
+        A watchdog thread starts with graphics mode and waits 20 seconds.
+        If the desktop has not drawn a frame AND taken a keystroke in that
+        time, it puts text mode back without needing the screen, the
+        keyboard, or the main loop to be working. Press a key when the
+        desktop appears -- that is what tells COS you can actually see it.
+
+  2. COS refuses to try again.
+        A marker file (~/.cos/gdr-attempt) is written just before the mode
+        set and removed once you have confirmed the desktop. If COS finds
+        that marker at startup, the last attempt did not survive, so it
+        starts in text mode and tells you instead of walking into the same
+        wall twice. Delete the file by hand to clear that.
+
+  3. You do it by hand.
+        Switch away and back:      Ctrl+Alt+F1   then   Ctrl+Alt+F<n>
+        where <n> is the VT COS is on. Switching VTs forces a modeset, which
+        is the same accident that used to "fix" the old ffplay blank screen.
+
+        From another VT or over SSH, if COS is wedged:
+            pkill -f 'cos(10).py'
+        The console is restored on exit, on atexit, and on SIGINT/SIGTERM/
+        SIGHUP, so killing it is safe.
+
+        To put a console back by force:
+            sudo chvt 1 && sudo chvt <n>
+
+  The error screen (the blue one) also gives the screen back before it
+  draws, so a crash in graphics mode is still readable.
+
+
+WHAT IT NEEDS
+
+  A DRM/KMS device        /dev/dri/card* that you can open. On a normal
+                          desktop login, logind puts an ACL on it for the
+                          user sitting at the machine, so this usually just
+                          works without being in the "video" group.
+
+  Dumb buffer support     Every KMS driver worth the name has it; the
+                          probe checks anyway.
+
+  A connected display     The first connected connector wins, at its
+                          preferred mode.
+
+  A PSF console font      From /usr/share/consolefonts. COS uses the font
+                          chosen in Preferences > DISPLAY if there is one,
+                          and falls back to Lat15-VGA16.
+
+  A real VT               Not a terminal window, not SSH. KD_GRAPHICS means
+                          nothing without a console to take.
+
+  "Check whether graphics mode can run here" in the BETA section tests all
+  of this and changes nothing.
+
+
+KNOWN LIMITATIONS  (it says BETA for a reason)
+
+  * Frames can tear. There is one buffer and the scanout reads it live.
+    A second buffer and a vblank wait would fix it and cost a frame of
+    latency; on a desktop made of text it has not seemed worth it.
+
+  * Box-drawing characters are drawn as pixel primitives, not glyphs,
+    because a Latin-1 console font has none. They are crisper than the
+    font would be, but they are COS's idea of a box, not the font's.
+
+  * The theme palette is still the console's 16 colours. The pipeline is
+    24-bit; nothing uses it yet except windows that hand over real pixels.
+
+  * Leaving to a shell (anything that drops out of curses) suspends
+    graphics mode and brings it back afterwards. You will see the screen
+    flick to text and back.
+
+  * Switching VTs away from COS while in graphics mode is not handled
+    properly yet -- COS does not get told, and does not re-take the CRTC
+    when you come back. Switch away and back again if it looks wrong.
+
+  * It has been tested cell-by-cell against a rendered frame, but the
+    final mode set is the one step that cannot be tested without taking
+    over a screen. That is the part most likely to surprise you.
+
+
+WHERE THIS LIVES
+
+  ~/cos/desk_rendr_info.txt     this file; the (i) button reads it, so you
+                                can edit it and the change shows up in COS
+  ~/.cos/gdr-attempt            the marker file described above
+  cos(10).py                    DrmDisplay, GlyphCache, GraphicsDesktop,
+                                in the "DESKTOP RENDERING" section
+
+================================================================================
+  COS v2.4 "Druman"  --  TCF (The Coloradan Financial)
+================================================================================

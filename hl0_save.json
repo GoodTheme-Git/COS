@@ -1,0 +1,16 @@
+{
+  "level": 0,
+  "health": 100,
+  "suit": 100,
+  "docs_found": [],
+  "missions_done": [
+    "m0_orient",
+    "m0_orient"
+  ],
+  "pos": [
+    5.227000000000004,
+    2.6160000000000005
+  ],
+  "yaw": 90.0,
+  "xen_bleed": 0
+}

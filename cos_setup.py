@@ -1,0 +1,1420 @@
+#!/usr/bin/env python3
+"""
+COS Setup Wizard
+Debian-installer style ncurses setup for Channel Operating System.
+Writes ~/.cos_config (JSON).
+Run standalone or launched from COS via POWER > Run Setup.
+"""
+import curses, os, sys, json, socket, subprocess, platform, hashlib, secrets
+import threading, time
+from datetime import datetime
+
+CONFIG_PATH = os.path.expanduser('~/.cos_config')
+
+# Settings, themes and wallpapers come from COS itself, so this wizard
+# offers exactly what COS understands. COS only defines things at import
+# time; it starts nothing until run() is called. Which file is COS is not a
+# given -- one machine runs cos(10).py with an old cos.py beside it -- so COS
+# names itself in $COS_PY when it launches setup, and cos.py next to this
+# file is only the fallback.
+def _load_cos():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.environ.get('COS_PY', ''), os.path.join(here, 'cos.py')):
+        if not (path and os.path.isfile(path)):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location('cos', path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception:
+            continue
+        if isinstance(getattr(mod, 'DEFAULTS', None), dict):
+            return mod
+    return None
+
+
+COS = _load_cos()
+
+
+def _cos(name, fallback):
+    return getattr(COS, name, fallback) if COS else fallback
+
+
+COS_DEFAULTS  = _cos('DEFAULTS', {})
+THEME_NAMES   = _cos('THEME_NAMES', ['COS Classic (Blue/Cyan)'])
+WALLPAPER_NAMES = [w[0] for w in _cos('WALLPAPERS', [('Solid', None)])]
+CURSOR_NAMES  = _cos('CURSOR_NAMES', ['plus'])
+QUALITY_ORDER = _cos('MEDIA_QUALITY_ORDER', ['fast', 'fine', 'detail'])
+ASPECTS       = _cos('CELL_ASPECT_CHOICES', ['auto'])
+
+
+def hash_password(password):
+    """Same scheme as COS's login screen (PBKDF2, salt kept beside it)."""
+    if COS and hasattr(COS, 'hash_password'):
+        return COS.hash_password(password)
+    salt = secrets.token_hex(8)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'),
+                                 salt.encode('ascii'), 120000).hex()
+    return salt, digest
+
+# -- Debian-style palette ------------------------------------------------------
+CP_BG       = 1   # main background: white on blue
+CP_TITLE    = 2   # top title bar
+CP_PANEL    = 3   # dialog box: black on light-grey
+CP_PANEL_T  = 4   # panel title: white on dark-blue
+CP_SEL      = 5   # selected item: white on dark-blue
+CP_UNSEL    = 6   # normal item: black on grey
+CP_BTN      = 7   # button normal
+CP_BTN_SEL  = 8   # button selected
+CP_HINT     = 9   # bottom hint bar
+CP_INPUT    = 10  # text input field
+CP_INPUT_A  = 11  # active input
+CP_WARN     = 12  # warning / error
+CP_GOOD     = 13  # success / ok
+CP_PROG     = 14  # progress bar fill
+
+def init_colors():
+    curses.start_color(); curses.use_default_colors()
+    # Debian-style: blue desktop, white-on-dark panels
+    curses.init_pair(CP_BG,      curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(CP_TITLE,   curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(CP_PANEL,   curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(CP_PANEL_T, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(CP_SEL,     curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(CP_UNSEL,   curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(CP_BTN,     curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(CP_BTN_SEL, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(CP_HINT,    curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(CP_INPUT,   curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(CP_INPUT_A, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(CP_WARN,    curses.COLOR_RED,   curses.COLOR_WHITE)
+    curses.init_pair(CP_GOOD,    curses.COLOR_GREEN, curses.COLOR_WHITE)
+    curses.init_pair(CP_PROG,    curses.COLOR_BLACK, curses.COLOR_CYAN)
+
+def ss(win, y, x, s, a=0):
+    try: win.addstr(y, x, s, a)
+    except curses.error: pass
+
+# =============================================================================
+# WINDOWS 98 SETUP LOOK, MUSIC, AND DRAGGABLE PANELS
+# =============================================================================
+# The wizard underneath is unchanged: pages still call draw_bg, make_panel,
+# draw_buttons and input_field, and still read keys from stdscr. Only those
+# helpers were rewritten, which is why every page got the new look at once.
+
+MUSIC_NAMES = ('installermusic.wav', 'installermusic.mp3', 'setupmusic.wav')
+MUSIC_BACKENDS = (
+    ('pw-play', lambda p: ['pw-play', p]),
+    ('paplay',  lambda p: ['paplay', p]),
+    ('aplay',   lambda p: ['aplay', '-q', p]),
+    ('ffplay',  lambda p: ['ffplay', '-nodisp', '-autoexit', '-loglevel',
+                           'quiet', p]),
+)
+
+
+def _which(prog):
+    for d in os.environ.get('PATH', '/usr/bin:/bin').split(os.pathsep):
+        f = os.path.join(d, prog)
+        if os.path.isfile(f) and os.access(f, os.X_OK):
+            return f
+    return None
+
+
+class SetupMusic:
+    """Loops the installer music for as long as setup is running.
+
+    Deliberately a subprocess per play rather than one looping player: the
+    backends that exist on a bare console do not agree on how to loop, and
+    respawning is the one thing all of them do. The thread that respawns is
+    a daemon and every exit path calls stop(), because music still playing
+    after the installer has gone is worse than no music.
+    """
+
+    def __init__(self, path=None):
+        # find() already checks, but a path handed in directly did not, and
+        # a missing file meant respawning a player onto nothing.
+        if path and not os.path.isfile(os.path.expanduser(path)):
+            path = None
+        self.path = os.path.expanduser(path) if path else self.find()
+        self.backend = None
+        self.cmd = None
+        self.proc = None
+        self.thread = None
+        self.plays = 0
+        self.note = ''
+        self._stop = threading.Event()
+        if os.environ.get('COS_SILENT'):
+            self.note = 'silenced by COS_SILENT'
+            self.path = None
+        elif not self.path:
+            self.note = 'no installer music found'
+        else:
+            for name, build in MUSIC_BACKENDS:
+                if _which(name):
+                    self.backend, self.cmd = name, build
+                    break
+            if not self.backend:
+                self.note = 'no audio player installed'
+
+    @staticmethod
+    def find():
+        here = os.path.dirname(os.path.abspath(__file__))
+        for d in (here, os.path.expanduser('~/cos'), os.path.expanduser('~')):
+            for n in MUSIC_NAMES:
+                p = os.path.join(d, n)
+                if os.path.isfile(p):
+                    return p
+        return None
+
+    def start(self):
+        if not (self.path and self.backend) or self.thread:
+            return False
+        self._stop.clear()
+        self.thread = threading.Thread(target=self._run, daemon=True,
+                                       name='cos-setup-music')
+        self.thread.start()
+        self.note = '%s via %s' % (os.path.basename(self.path), self.backend)
+        return True
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self.proc = subprocess.Popen(
+                    self.cmd(self.path), stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            except Exception as e:
+                self.note = 'music failed: %s' % e
+                return
+            self.plays += 1
+            while self.proc.poll() is None:
+                if self._stop.wait(0.2):
+                    break
+            if self._stop.is_set():
+                return
+            # a backend that dies instantly means it cannot play this file;
+            # looping on that would fork hundreds of processes a second
+            if self.plays >= 2 and self.proc.returncode not in (0, None):
+                self.note = 'music backend refused the file'
+                return
+
+    def stop(self):
+        self._stop.set()
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+                p.wait(timeout=1.5)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        self.proc = None
+
+
+MUSIC = SetupMusic()
+
+
+# -- the phases down the left, as Windows 98 Setup had them -------------------
+PHASES = (
+    ('Preparing Setup',       ('welcome',)),
+    ('Collecting Information', ('hostname', 'conn_type', 'conn_config', 'role',
+                                'port_setup', 'personal', 'input_sound',
+                                'display', 'startup', 'other')),
+    ('Copying Files',          ('summary',)),
+    ('Finishing Setup',        ('done',)),
+)
+SIDEBAR_W = 30
+_PAGE_NAME = ['welcome']
+
+
+def phase_of(page):
+    for i, (_label, pages) in enumerate(PHASES):
+        if page in pages:
+            return i
+    return 0
+
+
+class SetupUI:
+    """Where the dialog sits, and the pointer that can move it.
+
+    The installer borrows COS's own evdev pointer rather than asking for a
+    mouse protocol the console does not have. If it cannot be opened -- no
+    permission, no device -- everything still works from the keyboard and
+    nothing says anything about it.
+    """
+
+    def __init__(self):
+        self.dy = 0
+        self.dx = 0
+        self.pointer = None
+        self.dragging = None        # (grab_dy, grab_dx, h, w)
+        self.panel = None           # (win, y, x, h, w)
+        self.note = ''
+
+    def start_pointer(self, stdscr):
+        if self.pointer or COS is None or not hasattr(COS, 'Pointer'):
+            return
+        try:
+            state = dict(getattr(COS, 'DEFAULTS', {}))
+            state['messages'] = []
+            state['pointer_on'] = True
+            p = COS.Pointer(state)
+            if p.start():
+                H, W = stdscr.getmaxyx()
+                p.set_bounds(W, H)
+                self.pointer = p
+                self.note = p.status
+        except Exception as e:
+            self.note = 'pointer unavailable: %s' % e
+
+    def stop_pointer(self):
+        if self.pointer:
+            try:
+                self.pointer.stop()
+            except Exception:
+                pass
+            self.pointer = None
+
+    def remember(self, win, y, x, h, w):
+        self.panel = (win, y, x, h, w)
+
+    def clamp(self, stdscr, h, w):
+        H, W = stdscr.getmaxyx()
+        base_y = max(1, (H - h) // 2)
+        base_x = max(0, (W - w) // 2)
+        y = min(max(1, base_y + self.dy), max(1, H - h - 1))
+        x = min(max(SIDEBAR_W + 1 if W > SIDEBAR_W + w + 2 else 0,
+                    base_x + self.dx), max(0, W - w))
+        return y, x
+
+
+UI = SetupUI()
+
+
+def draw_bg(stdscr, title='COS Setup'):
+    """The blue field, the phase list down the left, the bars top and bottom.
+
+    This is the Windows 98 Setup furniture: a solid blue field, the four
+    phases listed on the left with the current one marked, and whatever
+    dialog the page opens sitting on top of it.
+    """
+    H, W = stdscr.getmaxyx()
+    stdscr.bkgd(' ', curses.color_pair(CP_BG))
+    stdscr.erase()
+    # top bar
+    ss(stdscr, 0, 0, ' ' * W, curses.color_pair(CP_TITLE))
+    ss(stdscr, 0, 1, ('COS Setup  -  %s' % title)[:W - 2],
+       curses.color_pair(CP_TITLE) | curses.A_BOLD)
+    # the phase list, if the console is wide enough to carry it
+    if W >= SIDEBAR_W + 44:
+        here = phase_of(_PAGE_NAME[0])
+        row = 3
+        ss(stdscr, row, 2, 'Windows of COS'[:SIDEBAR_W],
+           curses.color_pair(CP_BG) | curses.A_BOLD)
+        ss(stdscr, row + 1, 2, 'Setup', curses.color_pair(CP_BG) | curses.A_BOLD)
+        row += 4
+        for i, (label, _pages) in enumerate(PHASES):
+            if i < here:
+                mark, attr = 'x', curses.color_pair(CP_BG)
+            elif i == here:
+                mark, attr = '>', curses.color_pair(CP_BG) | curses.A_BOLD
+            else:
+                mark, attr = ' ', curses.color_pair(CP_BG) | curses.A_DIM
+            ss(stdscr, row, 2, '%s %s' % (mark, label[:SIDEBAR_W - 4]), attr)
+            row += 2
+        if MUSIC.plays:
+            ss(stdscr, H - 4, 2, '[music]'[:SIDEBAR_W],
+               curses.color_pair(CP_BG) | curses.A_DIM)
+    # bottom bar
+    ss(stdscr, H - 1, 0, ' ' * W, curses.color_pair(CP_HINT))
+    hint = ('  Arrows/Tab move   Enter select   Space toggle   ESC back'
+            + ('   drag a title bar to move it' if UI.pointer else ''))
+    ss(stdscr, H - 1, 0, hint[:W], curses.color_pair(CP_HINT))
+    if _STEP[1]:
+        draw_progress(stdscr, *_STEP)
+    stdscr.refresh()
+
+
+_STEP = [0, 0]      # (page, pages), shown as the bar along the bottom
+_RESULT = [None]    # 'written' once page_write has saved the config
+
+# Launched from inside COS (POWER > Run Setup), COS is already running and
+# reloads the config when we return; run on its own, setup starts COS itself.
+FROM_COS = os.environ.get('COS_SETUP_FROM_COS', '') not in ('', '0')
+
+
+def _bevel(win, h, w):
+    """A raised 3D edge, the way every Windows 95/98 dialog had one."""
+    hi = curses.color_pair(CP_PANEL) | curses.A_BOLD
+    lo = curses.color_pair(CP_PANEL) | curses.A_DIM
+    ss(win, 0, 0, '+' + '-' * max(0, w - 2) + '+', hi)
+    ss(win, h - 1, 0, '+' + '-' * max(0, w - 2) + '+', lo)
+    for r in range(1, h - 1):
+        ss(win, r, 0, '|', hi)
+        ss(win, r, w - 1, '|', lo)
+
+
+def make_panel(stdscr, title, h, w, extra_hint=''):
+    """A grey 98-style dialog: title bar, bevelled edge, drop shadow."""
+    H, W = stdscr.getmaxyx()
+    h = min(h, max(5, H - 3))
+    w = min(w, max(20, W - 2))
+    y, x = UI.clamp(stdscr, h, w)
+    # the shadow goes on the background, under where the dialog will sit
+    shadow = curses.color_pair(CP_BG) | curses.A_DIM
+    for r in range(y + 1, min(H - 1, y + h + 1)):
+        ss(stdscr, r, min(W - 2, x + w), '  '[:max(0, W - (x + w))], shadow)
+    if y + h < H - 1:
+        ss(stdscr, y + h, x + 2, ' ' * max(0, min(w, W - x - 2)), shadow)
+    stdscr.noutrefresh()
+    try:
+        win = curses.newwin(h, w, y, x)
+    except curses.error:
+        return None, y, x
+    win.bkgd(' ', curses.color_pair(CP_PANEL))
+    win.erase()
+    _bevel(win, h, w)
+    # title bar, blue with the caption on the left like 98
+    ss(win, 1, 1, ' ' * max(0, w - 2), curses.color_pair(CP_PANEL_T))
+    ss(win, 1, 2, title[:max(0, w - 6)],
+       curses.color_pair(CP_PANEL_T) | curses.A_BOLD)
+    if w > 10:
+        ss(win, 1, w - 4, '[X]', curses.color_pair(CP_PANEL_T))
+    if extra_hint:
+        ss(win, h - 2, max(1, (w - len(extra_hint)) // 2),
+           extra_hint[:w - 2], curses.color_pair(CP_HINT))
+    UI.remember(win, y, x, h, w)
+    return win, y, x
+
+
+def draw_progress(stdscr, step, total):
+    """The segmented bar 98 used, down at the bottom of the blue field."""
+    H, W = stdscr.getmaxyx()
+    pct = step / float(max(1, total))
+    bar_w = max(10, min(W - 26, 60))
+    x = max(2, (W - bar_w) // 2)
+    y = H - 3
+    ss(stdscr, y, x - 1, '[', curses.color_pair(CP_BG))
+    ss(stdscr, y, x + bar_w, ']', curses.color_pair(CP_BG))
+    blocks = int(bar_w * pct)
+    ss(stdscr, y, x, '#' * blocks, curses.color_pair(CP_PROG) | curses.A_BOLD)
+    ss(stdscr, y, x + blocks, ' ' * (bar_w - blocks), curses.color_pair(CP_BG))
+    label = ' Step %d of %d ' % (step, total)
+    ss(stdscr, y + 1, max(2, (W - len(label)) // 2), label,
+       curses.color_pair(CP_BG))
+
+
+def draw_buttons(win, h, w, buttons, sel):
+    """98 put its buttons at the bottom right, not centred."""
+    labels = ['  %s  ' % b for b in buttons]
+    total = sum(len(l) + 2 for l in labels) + (len(labels) - 1)
+    x = max(1, w - total - 3)
+    y = h - 3
+    for i, label in enumerate(labels):
+        if i == sel:
+            a = curses.color_pair(CP_BTN_SEL) | curses.A_BOLD
+            ss(win, y, x, '[%s]' % label, a)
+        else:
+            ss(win, y, x, '[%s]' % label, curses.color_pair(CP_BTN))
+        x += len(label) + 3
+
+
+def input_field(win, y, x, w, value, active):
+    """A sunken 98 text box: the field is lit, the edge is not."""
+    a = curses.color_pair(CP_INPUT_A) if active else curses.color_pair(CP_INPUT)
+    ss(win, y, x, ' ' * w, a)
+    shown = (value + ('_' if active else ''))[-w:] if value or active else ''
+    ss(win, y, x, shown[:w], a)
+
+
+# -- the pointer, and dragging a dialog by its title bar ----------------------
+def _outline(stdscr, y, x, h, w):
+    """Windows 2000 and below dragged an outline, not the window. So do we."""
+    H, W = stdscr.getmaxyx()
+    a = curses.color_pair(CP_BG) | curses.A_BOLD
+    if 0 <= y < H:
+        ss(stdscr, y, max(0, x), ('+' + '-' * max(0, w - 2) + '+')[:max(0, W - x)], a)
+    if 0 <= y + h - 1 < H:
+        ss(stdscr, y + h - 1, max(0, x),
+           ('+' + '-' * max(0, w - 2) + '+')[:max(0, W - x)], a)
+    for r in range(y + 1, min(H, y + h - 1)):
+        if r < 0:
+            continue
+        if 0 <= x < W:
+            ss(stdscr, r, x, '|', a)
+        if 0 <= x + w - 1 < W:
+            ss(stdscr, r, x + w - 1, '|', a)
+
+
+def ui_getch(stdscr):
+    """getch(), plus the pointer. Returns a key exactly as getch() would.
+
+    Dragging is handled here and never reaches the page: the dialog is moved
+    with mvwin(), which carries its contents, so the page does not have to
+    redraw and does not have to know it happened. Without a pointer this is
+    getch() with one extra function call.
+    """
+    if not UI.pointer:
+        return stdscr.getch()
+    stdscr.nodelay(True)
+    try:
+        while True:
+            key = stdscr.getch()
+            if key != -1:
+                return key
+            moved = False
+            for ev in UI.pointer.drain():
+                kind = ev[0]
+                px, py = UI.pointer.pos
+                if kind == 'press' and ev[1] == 1 and UI.panel:
+                    _win, wy, wx, wh, ww = UI.panel
+                    # the title bar is row 1 of the dialog, the way 98 had it
+                    if py == wy + 1 and wx <= px < wx + ww:
+                        UI.dragging = (py - wy, px - wx, wh, ww)
+                elif kind == 'move' and UI.dragging:
+                    moved = True
+                elif kind == 'release' and UI.dragging:
+                    gy, gx, wh, ww = UI.dragging
+                    UI.dragging = None
+                    H, W = stdscr.getmaxyx()
+                    ny = min(max(1, py - gy), max(1, H - wh - 1))
+                    nx = min(max(0, px - gx), max(0, W - ww))
+                    win, _oy, _ox, _h, _w = UI.panel
+                    try:
+                        win.mvwin(ny, nx)
+                    except curses.error:
+                        break
+                    base_y = max(1, (H - wh) // 2)
+                    base_x = max(0, (W - ww) // 2)
+                    UI.dy, UI.dx = ny - base_y, nx - base_x
+                    UI.remember(win, ny, nx, wh, ww)
+                    stdscr.touchwin()
+                    stdscr.refresh()
+                    win.refresh()
+                    moved = False
+            if moved and UI.dragging:
+                gy, gx, wh, ww = UI.dragging
+                px, py = UI.pointer.pos
+                stdscr.touchwin()
+                stdscr.refresh()
+                _outline(stdscr, py - gy, px - gx, wh, ww)
+                stdscr.refresh()
+            time.sleep(0.02)
+    finally:
+        stdscr.nodelay(False)
+
+
+# =============================================================================
+# WIZARD PAGES
+# =============================================================================
+
+def page_welcome(stdscr):
+    """Welcome / language-style intro."""
+    draw_bg(stdscr, 'Welcome')
+    H, W = stdscr.getmaxyx()
+    win, wy, wx = make_panel(stdscr, 'Welcome to COS Setup', 22, min(W-4, 64),
+                              '[ Press Enter to Continue ]')
+    if win is None: return True
+    lines = [
+        '',
+        '  Welcome to the COS (Channel Operating System)',
+        '  first-run configuration wizard.',
+        '',
+        '  This wizard will configure:',
+        '',
+        '    * Connection type (Dialup / Serial / Meshtastic)',
+        '    * Network role   (Server or Client)',
+        '    * Port / address assignments',
+        '    * Desktop look, sound, pointer and keyboard',
+        '    * Display mode, pictures and video',
+        '    * Boot splash, login and the Pigeon file server',
+        '    * Other system options',
+        '',
+        '  Settings are saved to  ~/.cos_config',
+        '  and loaded every time COS starts.',
+        '',
+        '  Arrows/Tab move, Left/Right/Space change, Enter=next.',
+    ]
+    for i, line in enumerate(lines):
+        ss(win, i+1, 1, line[:60], curses.color_pair(CP_PANEL))
+    win.refresh()
+    while True:
+        key = ui_getch(stdscr)
+        if key in (curses.KEY_ENTER, 10, 13): return True
+        elif key == 27: return False
+
+
+def page_hostname(stdscr, cfg):
+    """Set node name / hostname."""
+    draw_bg(stdscr, 'Node Identity')
+    H, W = stdscr.getmaxyx()
+    win, wy, wx = make_panel(stdscr, 'Node Identity', 14, min(W-4, 58),
+                              '[ Enter=next  ESC=back ]')
+    if win is None: return False
+    default_host = socket.gethostname()
+    fields = [
+        ('Node Name',  cfg.get('node_name') or default_host),
+        ('Username',   cfg.get('username') or os.environ.get('USER', 'user')),
+        ('Location',   cfg.get('location',  '')),
+    ]
+    cur_f = 0
+
+    while True:
+        ss(win, 2, 3, 'Identify this COS node on the network.',
+           curses.color_pair(CP_PANEL))
+        ss(win, 3, 3, 'These values appear in network headers.',
+           curses.color_pair(CP_PANEL))
+        for i, (label, _) in enumerate(fields):
+            val = fields[i][1]
+            active = (i == cur_f)
+            ss(win, 5+i*2, 3, f'{label:<16}', curses.color_pair(CP_PANEL) |
+               (curses.A_BOLD if active else 0))
+            input_field(win, 5+i*2, 20, 30, val, active)
+        draw_buttons(win, 14, win.getmaxyx()[1], ['  Next  ', '  Back  '], 0)
+        win.refresh()
+
+        key = ui_getch(stdscr)
+        if key == 27: return False
+        elif key == 9 or key == curses.KEY_DOWN:
+            cur_f = (cur_f + 1) % len(fields)
+        elif key == curses.KEY_UP:
+            cur_f = (cur_f - 1) % len(fields)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            cfg['node_name'] = fields[0][1]
+            cfg['username']  = fields[1][1]
+            cfg['location']  = fields[2][1]
+            return True
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            label, val = fields[cur_f]
+            fields[cur_f] = (label, val[:-1])
+        elif 32 <= key <= 126:
+            label, val = fields[cur_f]
+            fields[cur_f] = (label, val + chr(key))
+
+
+def page_connection_type(stdscr, cfg):
+    """Choose connection medium."""
+    draw_bg(stdscr, 'Connection Type')
+    H, W = stdscr.getmaxyx()
+    OPTIONS = [
+        ('dialup',      'Dialup Modem',       'PSTN / analog modem via phone line (Hayes AT)'),
+        ('serial',      'Serial / RS-232',    'Direct cable, null modem, or USB-serial adapter'),
+        ('meshtastic',  'Meshtastic',          'LoRa mesh radio via Meshtastic Python API'),
+        ('tcp',         'TCP/IP Network',      'Direct TCP socket over Ethernet / WiFi / LAN'),
+        ('all',         'All / Auto-detect',  'Try each medium in order; use what responds'),
+    ]
+    sel = next((i for i,(k,*_) in enumerate(OPTIONS) if k==cfg.get('conn_type','serial')), 1)
+    win, wy, wx = make_panel(stdscr, 'Connection Type', 16, min(W-4, 68),
+                              '[ Arrows=select  Enter=next  ESC=back ]')
+    if win is None: return False
+    while True:
+        ss(win, 2, 3, 'How will this node communicate?',
+           curses.color_pair(CP_PANEL) | curses.A_BOLD)
+        for i, (key, label, desc) in enumerate(OPTIONS):
+            marker = '(*) ' if i == sel else '( ) '
+            a = curses.color_pair(CP_SEL)|curses.A_BOLD if i==sel \
+                else curses.color_pair(CP_PANEL)
+            ss(win, 4+i*2, 3, f'{marker}{label:<22}  {desc}'[:win.getmaxyx()[1]-5], a)
+        draw_buttons(win, 16, win.getmaxyx()[1], ['  Next  ', '  Back  '], 0)
+        win.refresh()
+        key = ui_getch(stdscr)
+        if key == 27: return False
+        elif key == curses.KEY_UP:   sel = (sel-1) % len(OPTIONS)
+        elif key == curses.KEY_DOWN: sel = (sel+1) % len(OPTIONS)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            cfg['conn_type'] = OPTIONS[sel][0]
+            return True
+
+
+def page_conn_config(stdscr, cfg):
+    """Per-medium config (port, baud, device, etc.)"""
+    ctype = cfg.get('conn_type', 'serial')
+    draw_bg(stdscr, f'Configure: {ctype.title()}')
+    H, W = stdscr.getmaxyx()
+
+    FIELD_DEFS = {
+        'dialup': [
+            ('Device',    cfg.get('dialup_device',    '/dev/ttyS0')),
+            ('Baud',      cfg.get('dialup_baud',       '9600')),
+            ('Init Str',  cfg.get('dialup_init',       'ATZ')),
+            ('Dial Num',  cfg.get('dialup_number',     '')),
+            ('Dial Type', cfg.get('dialup_dial',       'ATDT')),
+        ],
+        'serial': [
+            ('Device',    cfg.get('serial_device',    '/dev/ttyUSB0')),
+            ('Baud',      cfg.get('serial_baud',       '9600')),
+            ('Data Bits', cfg.get('serial_databits',   '8')),
+            ('Parity',    cfg.get('serial_parity',     'N')),
+            ('Stop Bits', cfg.get('serial_stopbits',   '1')),
+        ],
+        'meshtastic': [
+            ('Device',    cfg.get('mesh_device',       '/dev/ttyUSB0')),
+            ('Channel',   cfg.get('mesh_channel',      '0')),
+            ('Node ID',   cfg.get('mesh_nodeid',       '')),
+            ('PSK',       cfg.get('mesh_psk',          '')),
+        ],
+        'tcp': [
+            ('Host/IP',   cfg.get('tcp_host',          '0.0.0.0')),
+            ('Port',      cfg.get('tcp_port',          '7373')),
+            ('Timeout',   cfg.get('tcp_timeout',       '30')),
+        ],
+        'all': [
+            ('Prefer',    cfg.get('auto_prefer',       'serial')),
+            ('Fallback',  cfg.get('auto_fallback',     'tcp')),
+        ],
+    }
+    fields = FIELD_DEFS.get(ctype, [('Option', '')])
+    h = len(fields) * 2 + 10
+    win, wy, wx = make_panel(stdscr, f'{ctype.title()} Settings', h, min(W-4, 60),
+                              '[ Enter=next  ESC=back ]')
+    if win is None: return False
+    cur_f = 0
+
+    KEY_MAP = {
+        'dialup':     ['dialup_device','dialup_baud','dialup_init','dialup_number','dialup_dial'],
+        'serial':     ['serial_device','serial_baud','serial_databits','serial_parity','serial_stopbits'],
+        'meshtastic': ['mesh_device','mesh_channel','mesh_nodeid','mesh_psk'],
+        'tcp':        ['tcp_host','tcp_port','tcp_timeout'],
+        'all':        ['auto_prefer','auto_fallback'],
+    }
+    cfg_keys = KEY_MAP.get(ctype, [])
+
+    while True:
+        ss(win, 2, 3, f'Settings for {ctype} connection:',
+           curses.color_pair(CP_PANEL) | curses.A_BOLD)
+        for i, (label, _) in enumerate(fields):
+            val = fields[i][1]; active = (i == cur_f)
+            ss(win, 4+i*2, 3, f'{label:<16}',
+               curses.color_pair(CP_PANEL)|(curses.A_BOLD if active else 0))
+            input_field(win, 4+i*2, 20, 32, val, active)
+        draw_buttons(win, h, win.getmaxyx()[1], ['  Next  ', '  Back  '], 0)
+        win.refresh()
+
+        key = ui_getch(stdscr)
+        if key == 27: return False
+        elif key == 9 or key == curses.KEY_DOWN: cur_f = (cur_f+1) % len(fields)
+        elif key == curses.KEY_UP:               cur_f = (cur_f-1) % len(fields)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            for i, ck in enumerate(cfg_keys):
+                cfg[ck] = fields[i][1]
+            return True
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            l, v = fields[cur_f]; fields[cur_f] = (l, v[:-1])
+        elif 32 <= key <= 126:
+            l, v = fields[cur_f]; fields[cur_f] = (l, v + chr(key))
+
+
+def page_role(stdscr, cfg):
+    """Server or client."""
+    draw_bg(stdscr, 'Network Role')
+    H, W = stdscr.getmaxyx()
+    OPTIONS = [
+        ('server', 'SERVER', 'This node accepts incoming connections from clients.'),
+        ('client', 'CLIENT', 'This node connects outward to a server.'),
+        ('peer',   'PEER',   'Peer-to-peer; both initiates and accepts (mesh/P2P).'),
+    ]
+    sel = next((i for i,(k,*_) in enumerate(OPTIONS) if k==cfg.get('role','client')), 1)
+    win, wy, wx = make_panel(stdscr, 'Network Role', 14, min(W-4, 66),
+                              '[ Arrows=select  Enter=next ]')
+    if win is None: return False
+    while True:
+        ss(win, 2, 3, 'What role does this node play on the network?',
+           curses.color_pair(CP_PANEL) | curses.A_BOLD)
+        for i, (key, label, desc) in enumerate(OPTIONS):
+            marker = '(*) ' if i==sel else '( ) '
+            a = curses.color_pair(CP_SEL)|curses.A_BOLD if i==sel \
+                else curses.color_pair(CP_PANEL)
+            ss(win, 4+i*2, 3, f'{marker}{label:<10}  {desc}'[:win.getmaxyx()[1]-5], a)
+        draw_buttons(win, 14, win.getmaxyx()[1], ['  Next  ', '  Back  '], 0)
+        win.refresh()
+        key = ui_getch(stdscr)
+        if key == 27: return False
+        elif key == curses.KEY_UP:   sel = (sel-1) % len(OPTIONS)
+        elif key == curses.KEY_DOWN: sel = (sel+1) % len(OPTIONS)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            cfg['role'] = OPTIONS[sel][0]; return True
+
+
+def page_server_ports(stdscr, cfg):
+    """Server: configure which ports clients use."""
+    draw_bg(stdscr, 'Server Port Configuration')
+    H, W = stdscr.getmaxyx()
+    win, wy, wx = make_panel(stdscr, 'Server: Client Port Assignments', 22, min(W-4, 64),
+                              '[ Enter=next  ESC=back ]')
+    if win is None: return False
+
+    fields = [
+        ('Listen Address', cfg.get('srv_bind',      '0.0.0.0')),
+        ('Primary Port',   cfg.get('srv_port',       '7373')),
+        ('Alt Port',       cfg.get('srv_alt_port',   '7374')),
+        ('Max Clients',    cfg.get('srv_max_clients','8')),
+        ('Serial Port 1',  cfg.get('srv_serial1',    '/dev/ttyUSB0')),
+        ('Serial Port 2',  cfg.get('srv_serial2',    '')),
+        ('Serial Port 3',  cfg.get('srv_serial3',    '')),
+        ('Mesh Channel',   cfg.get('srv_mesh_ch',    '0')),
+        ('Auth Token',     cfg.get('srv_auth',       '')),
+    ]
+    cfg_keys = ['srv_bind','srv_port','srv_alt_port','srv_max_clients',
+                'srv_serial1','srv_serial2','srv_serial3','srv_mesh_ch','srv_auth']
+    cur_f = 0
+
+    while True:
+        ss(win, 2, 3, 'Configure which ports/channels clients may connect on.',
+           curses.color_pair(CP_PANEL))
+        ss(win, 3, 3, 'Leave blank to disable a port.',
+           curses.color_pair(CP_PANEL))
+        for i, (label, _) in enumerate(fields):
+            val = fields[i][1]; active = (i == cur_f)
+            ss(win, 5+i*2, 3 if not active else 2, f'{label:<18}',
+               curses.color_pair(CP_PANEL)|(curses.A_BOLD if active else 0))
+            input_field(win, 5+i*2, 22, 34, val, active)
+        draw_buttons(win, 22, win.getmaxyx()[1], ['  Next  ', '  Back  '], 0)
+        win.refresh()
+
+        key = ui_getch(stdscr)
+        if key == 27: return False
+        elif key == 9 or key == curses.KEY_DOWN: cur_f = (cur_f+1) % len(fields)
+        elif key == curses.KEY_UP:               cur_f = (cur_f-1) % len(fields)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            for i, ck in enumerate(cfg_keys): cfg[ck] = fields[i][1]
+            return True
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            l, v = fields[cur_f]; fields[cur_f] = (l, v[:-1])
+        elif 32 <= key <= 126:
+            l, v = fields[cur_f]; fields[cur_f] = (l, v + chr(key))
+
+
+def page_client_server(stdscr, cfg):
+    """Client: where is the server?"""
+    draw_bg(stdscr, 'Server Connection')
+    H, W = stdscr.getmaxyx()
+    win, wy, wx = make_panel(stdscr, 'Client: Server Address', 18, min(W-4, 62),
+                              '[ Enter=next  ESC=back ]')
+    if win is None: return False
+
+    fields = [
+        ('Server Host/IP',  cfg.get('cli_host',       '')),
+        ('Server Port',     cfg.get('cli_port',        '7373')),
+        ('Serial Device',   cfg.get('cli_serial',      '/dev/ttyUSB0')),
+        ('Baud Rate',       cfg.get('cli_baud',        '9600')),
+        ('Mesh Channel',    cfg.get('cli_mesh_ch',     '0')),
+        ('Server Node ID',  cfg.get('cli_mesh_server', '')),
+        ('Auth Token',      cfg.get('cli_auth',        '')),
+    ]
+    cfg_keys = ['cli_host','cli_port','cli_serial','cli_baud',
+                'cli_mesh_ch','cli_mesh_server','cli_auth']
+    cur_f = 0
+
+    while True:
+        ss(win, 2, 3, 'Enter the address of the COS server to connect to.',
+           curses.color_pair(CP_PANEL))
+        ss(win, 3, 3, 'Fill only the fields relevant to your connection type.',
+           curses.color_pair(CP_PANEL))
+        for i, (label, _) in enumerate(fields):
+            val = fields[i][1]; active = (i == cur_f)
+            ss(win, 5+i*2, 3, f'{label:<18}',
+               curses.color_pair(CP_PANEL)|(curses.A_BOLD if active else 0))
+            input_field(win, 5+i*2, 22, 32, val, active)
+        draw_buttons(win, 18, win.getmaxyx()[1], ['  Next  ', '  Back  '], 0)
+        win.refresh()
+
+        key = ui_getch(stdscr)
+        if key == 27: return False
+        elif key == 9 or key == curses.KEY_DOWN: cur_f = (cur_f+1) % len(fields)
+        elif key == curses.KEY_UP:               cur_f = (cur_f-1) % len(fields)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            for i, ck in enumerate(cfg_keys): cfg[ck] = fields[i][1]
+            return True
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            l, v = fields[cur_f]; fields[cur_f] = (l, v[:-1])
+        elif 32 <= key <= 126:
+            l, v = fields[cur_f]; fields[cur_f] = (l, v + chr(key))
+
+
+# -- Generic settings page -----------------------------------------------------
+# Each row is (kind, label, key, extra), the same shape as COS's Preferences:
+#   'head'     section heading
+#   'bool'     [X] toggle
+#   'choice'   extra = [(value, label), ...]
+#   'int'      extra = (lo, hi, step)
+#   'float'    extra = (lo, hi, step)
+#   'text'     free text, typed straight into the selected row
+#   'password' shown as stars; only a PBKDF2 hash is stored
+def _opts(values, labels=None):
+    return list(zip(values, labels or [str(v) for v in values]))
+
+
+def _choice_index(extra, val):
+    return next((i for i, (v, _) in enumerate(extra) if v == val), 0)
+
+
+def _row_value(kind, key, extra, vals):
+    val = vals.get(key)
+    if kind == 'bool':
+        return '[X]' if val else '[ ]'
+    if kind == 'choice':
+        return f'< {extra[_choice_index(extra, val)][1]} >'
+    if kind == 'float':
+        return f'< {float(val or 0):.1f} >'
+    if kind == 'int':
+        return f'< {val} >'
+    if kind == 'password':
+        if vals.get('_password'):
+            return '(new password set)'
+        return '(unchanged)' if vals.get('login_hash') else '(none)'
+    return str(val or '')
+
+
+def page_settings(stdscr, cfg, title, intro, rows):
+    """A scrolling list of COS settings. Enter on a non-text row = Next."""
+    draw_bg(stdscr, title)
+    H, W = stdscr.getmaxyx()
+    vals = dict(cfg)
+    vals.pop('_password', None)
+    pick = [i for i, r in enumerate(rows) if r[0] != 'head']
+    cur = 0
+    scroll = 0
+    h = max(10, min(H - 3, len(rows) + 9))
+    w = min(W - 4, 70)
+
+    while True:
+        win, wy, wx = make_panel(stdscr, title, h, w,
+                                 '[ Arrows=select  Left/Right/Space=change  '
+                                 'type into fields  Enter=next ]')
+        if win is None: return False
+        for i, line in enumerate(intro[:2]):
+            ss(win, 2+i, 3, line[:w-6], curses.color_pair(CP_PANEL))
+        top = 2 + len(intro[:2]) + 1
+        vis = h - top - 4
+        r_sel = pick[cur]
+        if r_sel < scroll: scroll = r_sel
+        if r_sel >= scroll + vis: scroll = r_sel - vis + 1
+        if scroll > 0 and rows[scroll-1][0] == 'head' and r_sel - scroll + 1 < vis:
+            scroll -= 1         # keep a row's heading on screen with it
+        for n, (kind, label, key, extra) in enumerate(rows[scroll:scroll+vis]):
+            y = top + n
+            if kind == 'head':
+                ss(win, y, 3, f'{label}:'[:w-6],
+                   curses.color_pair(CP_PANEL) | curses.A_BOLD)
+                continue
+            active = (scroll + n == r_sel)
+            a = curses.color_pair(CP_SEL) | curses.A_BOLD if active \
+                else curses.color_pair(CP_PANEL)
+            if kind in ('text', 'password'):
+                ss(win, y, 5, f'{label:<30}'[:w-8], a)
+                fw = max(6, w - 40)
+                if kind == 'text':
+                    input_field(win, y, 36, fw, str(vals.get(key) or ''), active)
+                elif active or vals.get('_password'):
+                    input_field(win, y, 36, fw,
+                                '*' * len(vals.get('_password') or ''), active)
+                else:
+                    ss(win, y, 36, _row_value(kind, key, extra, vals)[:fw], a)
+            else:
+                ss(win, y, 5, f'{label:<30} {_row_value(kind, key, extra, vals)}'[:w-8], a)
+        if len(rows) > vis:
+            ss(win, h-3, w-14, f' {scroll+1}-{min(len(rows), scroll+vis)}/{len(rows)} ',
+               curses.color_pair(CP_PANEL))
+        draw_buttons(win, h, w, ['  Next  ', '  Back  '], 0)
+        win.refresh()
+
+        key_ = ui_getch(stdscr)
+        kind, label, key, extra = rows[r_sel]
+        typed = kind in ('text', 'password')
+        buf_key = '_password' if kind == 'password' else key
+        if key_ == 27: return False
+        elif key_ in (curses.KEY_UP, curses.KEY_BTAB):
+            cur = (cur - 1) % len(pick)
+        elif key_ in (curses.KEY_DOWN, 9):
+            cur = (cur + 1) % len(pick)
+        elif typed and key_ in (curses.KEY_BACKSPACE, 127, 8):
+            vals[buf_key] = str(vals.get(buf_key) or '')[:-1]
+        elif typed and 32 <= key_ <= 126:
+            vals[buf_key] = str(vals.get(buf_key) or '') + chr(key_)
+            if kind == 'password':
+                vals['login_enabled'] = True
+        elif key_ in (curses.KEY_LEFT, curses.KEY_RIGHT, ord(' ')):
+            d = -1 if key_ == curses.KEY_LEFT else 1
+            if kind == 'bool':
+                vals[key] = not vals.get(key)
+            elif kind == 'choice':
+                vals[key] = extra[(_choice_index(extra, vals.get(key)) + d) % len(extra)][0]
+            elif kind in ('int', 'float'):
+                lo, hi, step = extra
+                num = float(vals.get(key) or lo) + d * step
+                num = max(lo, min(hi, num))
+                vals[key] = int(num) if kind == 'int' else round(num, 2)
+        elif key_ in (curses.KEY_ENTER, 10, 13):
+            pw = vals.pop('_password', None)
+            if pw:
+                vals['login_salt'], vals['login_hash'] = hash_password(pw)
+            cfg.update(vals)
+            return True
+
+
+def page_desktop(stdscr, cfg):
+    """The desktop's look: everything in COS's Desktop Settings."""
+    return page_settings(stdscr, cfg, 'Desktop Personalization', [
+        'How the COS desktop looks. All of this can be changed later',
+        'from EDIT > Preferences and Desktop Settings inside COS.',
+    ], [
+        ('head', 'Colours and wallpaper', None, None),
+        ('choice', 'Color theme', 'theme_idx',
+         _opts(range(len(THEME_NAMES)), THEME_NAMES)),
+        ('choice', 'Wallpaper pattern', 'wallpaper_idx',
+         _opts(range(len(WALLPAPER_NAMES)), WALLPAPER_NAMES)),
+        ('int', 'Pattern scale', 'wallpaper_scale', (2, 24, 1)),
+        ('text', 'Wallpaper picture (graphics)', 'wallpaper_image', None),
+        ('choice', 'Picture fit', 'wallpaper_fit',
+         _opts(['fill', 'fit', 'stretch'])),
+        ('head', 'Bars and icons', None, None),
+        ('choice', 'Menu bar position', 'bar_position', _opts(['top', 'bottom'])),
+        ('bool', 'Show taskbar', 'show_taskbar', None),
+        ('bool', 'Show desktop icons', 'show_icons', None),
+        ('choice', 'Icon arrangement', 'icon_layout',
+         _opts(['column', 'row', 'grid'])),
+        ('bool', 'Clock in status bar', 'pref_clock', None),
+        ('bool', 'Pointer coords in status bar', 'pref_mouse', None),
+        ('bool', 'Show the message log', 'show_log', None),
+        ('int', 'Message log lines', 'log_lines', (1, 20, 1)),
+        ('head', 'Banner and pointer', None, None),
+        ('choice', 'Banner', 'logo_mode', _opts(
+            ['builtin', 'art', 'text', 'none'],
+            ['built-in', 'ANSI art file', 'my own text', 'none'])),
+        ('text', 'Banner art file', 'logo_file', None),
+        ('text', 'Banner text', 'logo_text', None),
+        ('choice', 'Cursor shape', 'cursor_shape', _opts(CURSOR_NAMES)),
+        ('bool', 'Outline drag (Win2000 style)', 'outline_drag', None),
+    ])
+
+
+def page_input_sound(stdscr, cfg):
+    return page_settings(stdscr, cfg, 'Sound, Pointer and Keyboard', [
+        'COS reads the touchpad and mouse itself, without X or gpm.',
+        'Pointer speed is tuned later in CONTROL > Pointer Setup.',
+    ], [
+        ('head', 'Sound', None, None),
+        ('bool', 'Sounds enabled', 'sound_on', None),
+        ('int', 'Sound volume', 'sound_volume', (0, 100, 5)),
+        ('int', 'Druman volume', 'druman_volume', (0, 100, 5)),
+        ('head', 'Pointer', None, None),
+        ('bool', 'Pointer enabled', 'pointer_on', None),
+        ('bool', 'Auto-calibrate speed to the pad', 'pointer_auto_speed', None),
+        ('bool', 'Pointer acceleration', 'pointer_accel', None),
+        ('bool', 'Tap to click', 'tap_to_click', None),
+        ('bool', 'Natural (reversed) scrolling', 'natural_scroll', None),
+        ('head', 'Keyboard', None, None),
+        ('bool', 'Read Ctrl/Alt/Super from evdev', 'keyboard_modifiers', None),
+        ('bool', 'Ctrl+letter opens the menus', 'ctrl_opens_menus', None),
+    ])
+
+
+def page_display(stdscr, cfg):
+    return page_settings(stdscr, cfg, 'Display, Pictures and Video', [
+        'Graphics mode is BETA: if it fails COS falls back to text mode.',
+        'The boot animation plays, as real pixels, in graphics mode.',
+    ], [
+        ('head', 'Desktop rendering', None, None),
+        ('choice', 'Rendering', 'desktop_render', _opts(
+            ['text', 'graphics'],
+            ['text mode (regular)', 'graphics mode (BETA)'])),
+        ('bool', 'Windows may draw true pixels', 'gdr_pixel_windows', None),
+        ('choice', 'Cell aspect ratio', 'cell_aspect', _opts(ASPECTS)),
+        ('head', 'Pictures and video', None, None),
+        ('choice', 'Renderer', 'media_backend', _opts(
+            ['ascii', 'ffplay'], ['AsciiPic / AsciiVid', 'ffplay (pixels)'])),
+        ('choice', 'AsciiPic/AsciiVid quality', 'media_quality',
+         _opts(QUALITY_ORDER)),
+        ('int', 'AsciiVid frame rate cap', 'media_fps_cap', (4, 30, 1)),
+        ('bool', 'Pre-render video first', 'media_prerender', None),
+        ('bool', 'Monochrome rendering', 'media_mono', None),
+        ('bool', 'ffplay fullscreen', 'ffplay_fullscreen', None),
+    ])
+
+
+def page_startup(stdscr, cfg):
+    return page_settings(stdscr, cfg, 'Startup, Login and Network', [
+        'The login is a screen lock for the look of the thing, not',
+        'security. Only a PBKDF2 hash of the password is stored.',
+    ], [
+        ('head', 'Startup', None, None),
+        ('bool', 'Show the boot splash', 'boot_splash', None),
+        ('float', 'Linger once ready (seconds)', 'boot_splash_hold', (0.0, 5.0, 0.2)),
+        ('bool', 'Show the first-start picture', '_first_start', None),
+        ('text', 'Splash picture (no animation)', 'splash_image', None),
+        ('bool', 'Safe mode (no .cosapp apps)', 'apps_off', None),
+        ('bool', 'Safe mode (no .cdi drivers)', 'drivers_off', None),
+        ('head', 'Login', None, None),
+        ('bool', 'Ask for a password at startup', 'login_enabled', None),
+        ('text', 'Login user (blank = $USER)', 'login_user', None),
+        ('password', 'Password', 'login_hash', None),
+        ('head', 'TCF_IBBS message board', None, None),
+        ('text', 'Board server (host:port)', 'ibbs_server', None),
+        ('text', 'Board token', 'ibbs_token', None),
+        ('text', 'Name on the board', 'ibbs_name', None),
+        ('text', 'Room', 'ibbs_room', None),
+        ('head', 'Pigeon file server', None, None),
+        ('text', 'Shared folder (blank = COS dir)', 'share_dir', None),
+        ('int', 'Port', 'share_port', (1024, 65535, 1)),
+        ('bool', 'Random token in the URL', 'share_token', None),
+    ])
+
+
+def page_other(stdscr, cfg):
+    """Misc options: startup, logging, protocol tweaks."""
+    draw_bg(stdscr, 'Other Options')
+    H, W = stdscr.getmaxyx()
+
+    STARTUP = ['COS Desktop (default)', 'COS Shell', 'Batch Shell',
+               'Retro Shell', 'POS Shell', 'Setup (always re-run)']
+    START_K = ['desktop', 'cos_shell', 'batch_shell', 'retro_shell', 'pos_shell', 'setup']
+    cur_start = next((i for i, k in enumerate(START_K)
+                      if k == cfg.get('startup_mode', 'desktop')), 0)
+
+    auto_conn  = cfg.get('auto_connect',   True)
+    log_ena    = cfg.get('logging',        True)
+    log_file   = cfg.get('log_file',       '/tmp/cos.log')
+    bell_ena   = cfg.get('bell',           False)
+    timeout    = cfg.get('conn_timeout',   '30')
+
+    sections   = ['startup', 'toggles', 'logfile', 'timeout']
+    cur_sec    = 0
+    cur_row    = [cur_start, 0, 0, 0]
+    editing    = False
+    edit_target= None
+
+    while True:
+        win, wy, wx = make_panel(stdscr, 'Other Options', 26, min(W-4, 64),
+                                  '[ Tab=section  Space=toggle  Enter=next ]')
+        if win is None: return False
+
+        # Startup mode
+        sh = (cur_sec == 0)
+        ss(win, 2, 3, 'Default Startup Mode:',
+           curses.color_pair(CP_PANEL_T if sh else CP_PANEL)|curses.A_BOLD)
+        for i, name in enumerate(STARTUP):
+            mark = '(*) ' if i==cur_start else '( ) '
+            a = curses.color_pair(CP_SEL)|curses.A_BOLD if (sh and i==cur_row[0]) \
+                else curses.color_pair(CP_PANEL)
+            ss(win, 3+i, 5, f'{mark}{name}'[:52], a)
+
+        # Toggles
+        sh = (cur_sec == 1)
+        ss(win, 11, 3, 'Options:',
+           curses.color_pair(CP_PANEL_T if sh else CP_PANEL)|curses.A_BOLD)
+        for i, (label, val) in enumerate([
+                ('Auto-connect on startup',     auto_conn),
+                ('Enable session logging',      log_ena),
+                ('Terminal bell on events',     bell_ena),
+        ]):
+            mark = '[X] ' if val else '[ ] '
+            a = curses.color_pair(CP_SEL)|curses.A_BOLD if (sh and i==cur_row[1]) \
+                else curses.color_pair(CP_PANEL)
+            ss(win, 12+i, 5, f'{mark}{label}', a)
+
+        # Log file
+        sh = (cur_sec == 2)
+        ss(win, 16, 3, 'Log File Path:',
+           curses.color_pair(CP_PANEL_T if sh else CP_PANEL)|curses.A_BOLD)
+        input_field(win, 17, 5, 50, log_file, sh and editing)
+
+        # Timeout
+        sh = (cur_sec == 3)
+        ss(win, 19, 3, 'Connection Timeout (seconds):',
+           curses.color_pair(CP_PANEL_T if sh else CP_PANEL)|curses.A_BOLD)
+        input_field(win, 20, 5, 10, timeout, sh and editing)
+
+        draw_buttons(win, 26, win.getmaxyx()[1], ['  Next  ', '  Back  '], 0)
+        win.refresh()
+
+        key = ui_getch(stdscr)
+        if editing:
+            if key in (curses.KEY_ENTER, 10, 13, 27): editing = False
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                if cur_sec == 2:   log_file = log_file[:-1]
+                elif cur_sec == 3: timeout  = timeout[:-1]
+            elif 32 <= key <= 126:
+                if cur_sec == 2:   log_file += chr(key)
+                elif cur_sec == 3: timeout  += chr(key)
+            continue
+        if key == 27: return False
+        elif key == 9: cur_sec = (cur_sec + 1) % len(sections)
+        elif key == curses.KEY_UP:
+            if   cur_sec == 0: cur_row[0]=(cur_row[0]-1)%len(STARTUP); cur_start=cur_row[0]
+            elif cur_sec == 1: cur_row[1]=(cur_row[1]-1)%3
+        elif key == curses.KEY_DOWN:
+            if   cur_sec == 0: cur_row[0]=(cur_row[0]+1)%len(STARTUP); cur_start=cur_row[0]
+            elif cur_sec == 1: cur_row[1]=(cur_row[1]+1)%3
+        elif key == ord(' '):
+            if cur_sec == 1:
+                if cur_row[1]==0: auto_conn = not auto_conn
+                elif cur_row[1]==1: log_ena = not log_ena
+                elif cur_row[1]==2: bell_ena = not bell_ena
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if cur_sec in (2, 3): editing = True
+            else:
+                cfg['startup_mode'] = START_K[cur_start]
+                cfg['auto_connect'] = auto_conn
+                cfg['logging']      = log_ena
+                cfg['bell']         = bell_ena
+                cfg['log_file']     = log_file
+                cfg['conn_timeout'] = timeout
+                return True
+
+
+def page_summary(stdscr, cfg):
+    """Show full config summary before writing."""
+    draw_bg(stdscr, 'Configuration Summary')
+    H, W = stdscr.getmaxyx()
+
+    LABELS = [
+        ('Node Name',     'node_name'),
+        ('Username',      'username'),
+        ('Location',      'location'),
+        ('Conn Type',     'conn_type'),
+        ('Role',          'role'),
+        ('Server Bind',   'srv_bind'),
+        ('Server Port',   'srv_port'),
+        ('Alt Port',      'srv_alt_port'),
+        ('Max Clients',   'srv_max_clients'),
+        ('Srv Serial 1',  'srv_serial1'),
+        ('Srv Serial 2',  'srv_serial2'),
+        ('Srv Serial 3',  'srv_serial3'),
+        ('Srv Mesh Ch',   'srv_mesh_ch'),
+        ('Cli Host',      'cli_host'),
+        ('Cli Port',      'cli_port'),
+        ('Theme',         'theme_idx'),
+        ('Wallpaper',     'wallpaper_idx'),
+        ('Bar Position',  'bar_position'),
+        ('Cursor',        'cursor_shape'),
+        ('Banner',        'logo_mode'),
+        ('Sound',         'sound_on'),
+        ('Volume',        'sound_volume'),
+        ('Pointer',       'pointer_on'),
+        ('Tap to Click',  'tap_to_click'),
+        ('Rendering',     'desktop_render'),
+        ('Media',         'media_backend'),
+        ('Media Quality', 'media_quality'),
+        ('Boot Splash',   'boot_splash'),
+        ('Login',         'login_enabled'),
+        ('Pigeon Port',   'share_port'),
+        ('Startup Mode',  'startup_mode'),
+        ('Auto Connect',  'auto_connect'),
+        ('Logging',       'logging'),
+        ('Log File',      'log_file'),
+    ]
+    def shown(key):
+        val = cfg.get(key, '')
+        if key == 'theme_idx' and isinstance(val, int) and 0 <= val < len(THEME_NAMES):
+            return THEME_NAMES[val]
+        if key == 'wallpaper_idx' and isinstance(val, int) and 0 <= val < len(WALLPAPER_NAMES):
+            return WALLPAPER_NAMES[val]
+        if isinstance(val, bool):
+            return 'on' if val else 'off'
+        return str(val)
+    lines = [f'  {lbl:<18} {shown(key)}' for lbl, key in LABELS
+             if cfg.get(key, '') not in ('', None)]
+    scroll = 0; btn_sel = 0
+
+    while True:
+        h = min(len(lines)+10, H-4); w = min(W-4, 68)
+        win, wy, wx = make_panel(stdscr, 'Review Configuration', h, w,
+                                  '[ Enter=write config  B=back  Q=abort ]')
+        if win is None: return 'abort'
+        ss(win, 2, 3, 'The following settings will be written to:',
+           curses.color_pair(CP_PANEL))
+        ss(win, 3, 3, CONFIG_PATH, curses.color_pair(CP_GOOD)|curses.A_BOLD)
+        max_vis = h - 8
+        vis = lines[scroll:scroll+max_vis]
+        for i, line in enumerate(vis):
+            ss(win, 5+i, 2, line[:w-4], curses.color_pair(CP_PANEL))
+        if len(lines) > max_vis:
+            ss(win, h-3, 3, f'  {scroll+1}-{scroll+len(vis)}/{len(lines)}  UP/DN to scroll',
+               curses.color_pair(CP_PANEL))
+        draw_buttons(win, h, w, ['  Write Config  ', '  Back  ', '  Abort  '], btn_sel)
+        win.refresh()
+
+        key = ui_getch(stdscr)
+        if key == curses.KEY_UP:   scroll = max(0, scroll-1)
+        elif key == curses.KEY_DOWN: scroll = min(max(0, len(lines)-max_vis), scroll+1)
+        elif key == 9: btn_sel = (btn_sel+1) % 3
+        elif key == ord('b'): return 'back'
+        elif key == ord('q'): return 'abort'
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if btn_sel == 0: return 'write'
+            elif btn_sel == 1: return 'back'
+            else: return 'abort'
+        elif key == 27: return 'back'
+
+
+def page_write(stdscr, cfg):
+    """Write config and show success."""
+    draw_bg(stdscr, 'Writing Configuration')
+    H, W = stdscr.getmaxyx()
+    win, wy, wx = make_panel(stdscr, 'Writing Configuration', 14, min(W-4, 56))
+    if win is None: return
+
+    cfg['setup_complete'] = True
+    cfg['setup_date']     = datetime.now().isoformat()
+    if '_first_start' in cfg:
+        cfg['boot_seen'] = not cfg.pop('_first_start')
+    for k in [k for k in cfg if k.startswith('_')]:
+        del cfg[k]                  # wizard-only scratch values
+
+    steps = [
+        ('Preparing configuration...', 0.3),
+        (f'Writing {CONFIG_PATH}',     0.6),
+        ('Verifying file...',           0.9),
+        ('Done!',                       1.0),
+    ]
+    for i, (msg, pct) in enumerate(steps):
+        ss(win, 3+i*2, 4, msg, curses.color_pair(CP_PANEL))
+        bar_w = win.getmaxyx()[1] - 8
+        filled = int(bar_w * pct)
+        ss(win, 4+i*2, 4, f'[{"="*filled}{"."*(bar_w-filled)}]',
+           curses.color_pair(CP_PROG))
+        win.refresh()
+        import time; time.sleep(0.12)
+
+    try:
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(cfg, f, indent=2)
+        ss(win, 10, 4, f'Saved to {CONFIG_PATH}',
+           curses.color_pair(CP_GOOD)|curses.A_BOLD)
+    except Exception as e:
+        ss(win, 10, 4, f'ERROR: {e}'[:50],
+           curses.color_pair(CP_WARN)|curses.A_BOLD)
+
+    nxt = 'return to COS' if FROM_COS else 'start COS'
+    ss(win, 12, 4, f'[ Press any key to {nxt} ]', curses.color_pair(CP_HINT))
+    win.refresh()
+    ui_getch(stdscr)
+    _RESULT[0] = 'written'
+
+
+# =============================================================================
+# WIZARD FLOW
+# =============================================================================
+
+def run_wizard(stdscr):
+    curses.cbreak(); curses.noecho(); stdscr.keypad(True); curses.curs_set(0)
+    init_colors()
+    MUSIC.start()
+    UI.start_pointer(stdscr)
+
+    # Load existing config if present
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+    # Start from COS's own defaults so every page shows real values and the
+    # file written is one COS reads as current (a config without
+    # wallpaper_scale is treated as pre-v3.1 and has its wallpaper remapped).
+    for k, v in COS_DEFAULTS.items():
+        cfg.setdefault(k, list(v) if isinstance(v, list) else v)
+    cfg['_first_start'] = not cfg.get('boot_seen', False)
+
+    # Page stack for back navigation
+    PAGES = [
+        ('welcome',      lambda: page_welcome(stdscr)),
+        ('hostname',     lambda: page_hostname(stdscr, cfg)),
+        ('conn_type',    lambda: page_connection_type(stdscr, cfg)),
+        ('conn_config',  lambda: page_conn_config(stdscr, cfg)),
+        ('role',         lambda: page_role(stdscr, cfg)),
+        ('port_setup',   lambda: _page_ports(stdscr, cfg)),
+        ('personal',     lambda: page_desktop(stdscr, cfg)),
+        ('input_sound',  lambda: page_input_sound(stdscr, cfg)),
+        ('display',      lambda: page_display(stdscr, cfg)),
+        ('startup',      lambda: page_startup(stdscr, cfg)),
+        ('other',        lambda: page_other(stdscr, cfg)),
+        ('summary',      lambda: _page_summary_flow(stdscr, cfg)),
+    ]
+
+    def _page_ports(stdscr, cfg):
+        role = cfg.get('role', 'client')
+        if role == 'server': return page_server_ports(stdscr, cfg)
+        elif role == 'client': return page_client_server(stdscr, cfg)
+        else: return True  # peer: skip for now
+
+    def _page_summary_flow(stdscr, cfg):
+        result = page_summary(stdscr, cfg)
+        if result == 'write':
+            page_write(stdscr, cfg)
+            return True
+        elif result == 'abort':
+            return 'abort'
+        else:
+            return False
+
+    idx = 0
+    while 0 <= idx < len(PAGES):
+        name, fn = PAGES[idx]
+        _PAGE_NAME[0] = name
+        _STEP[:] = [idx+1, len(PAGES)]
+        result = fn()
+        if result == 'abort':
+            break
+        elif result:
+            idx += 1
+        else:
+            idx = max(0, idx - 1)
+
+    # Final screen. Setup goes straight on into COS rather than telling the
+    # user to start it: main() hands the process over once curses is down.
+    if _RESULT[0] != 'written':
+        return
+    _PAGE_NAME[0] = 'done'
+    draw_bg(stdscr, 'Setup Complete')
+    H, W = stdscr.getmaxyx()
+    win, wy, wx = make_panel(stdscr, 'Setup Complete', 10, min(W-4, 52))
+    if win:
+        ss(win, 3, 4, 'COS setup is complete.', curses.color_pair(CP_GOOD)|curses.A_BOLD)
+        ss(win, 4, 4, f'Config: {CONFIG_PATH}', curses.color_pair(CP_PANEL))
+        ss(win, 6, 4, ('Returning to COS...' if FROM_COS else 'Starting COS...'),
+           curses.color_pair(CP_PANEL)|curses.A_BOLD)
+        win.refresh()
+        import time; time.sleep(1.0)
+
+
+def cos_entry():
+    """The COS file to start once setup is done, or None."""
+    path = getattr(COS, '__file__', None) if COS else None
+    if not path:
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cos.py')
+        path = here if os.path.isfile(here) else None
+    return os.path.abspath(path) if path else None
+
+
+def main():
+    try:
+        curses.wrapper(run_wizard)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Music still playing after the installer has gone is worse than no
+        # music, and a pointer thread left running holds the input device.
+        # Both have to be gone before the exec below as well: exec replaces
+        # this process, but not a player it spawned.
+        MUSIC.stop()
+        UI.stop_pointer()
+    if _RESULT[0] != 'written':
+        print('\nCOS Setup cancelled; nothing was written.')
+        return
+    if FROM_COS:
+        return                      # COS is waiting for us and reloads the config
+    entry = cos_entry()
+    if not entry:
+        print('\nCOS Setup finished, but no COS file was found to start.')
+        print(f'Config: {CONFIG_PATH}')
+        return
+    # Straight into COS: this process becomes COS, so quitting COS leaves the
+    # user where they ran setup from, not in a leftover setup process.
+    os.execv(sys.executable, [sys.executable, entry])
+
+if __name__ == '__main__':
+    main()
