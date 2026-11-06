@@ -1,0 +1,491 @@
+"""TCF IBBS for COS Neptune: the TCF Internal Bulletin Board System in Aero.
+
+This is a window around ibbs.py, not a rewrite of it: the package installs
+ibbs.py next to this app and the app imports it, the same way COS v2.4's
+built-in IBBS window does. Rooms, live chat, board files, local boards and
+board servers (with tokens) all come straight from ibbs.py.
+"""
+import importlib.util
+import json
+import os
+import socket
+import sys
+import threading
+import time
+
+NEPAPP = {
+    'name':        'IBBS',
+    'icon':        'bbs',
+    'version':     '1.0',
+    'author':      'TCF',
+    'description': 'TCF Internal Bulletin Board System: chat rooms and shared files, on this machine '
+                   'or through a board server.',
+    'desktop':     True,
+}
+
+POLL = 0.6
+KEEP = 500
+
+
+def _engine_paths():
+    state = neptune.theme.STATE
+    return [os.path.join(state, 'packages', 'IBBS', 'files', 'ibbs.py'),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ibbs.py'),
+            os.path.expanduser('~/cos/ibbs.py'), os.path.expanduser('~/ibbs.py')]
+
+
+def load_engine():
+    for p in _engine_paths():
+        if os.path.isfile(p):
+            spec = importlib.util.spec_from_file_location('tcf_ibbs_engine', p)
+            mod = importlib.util.module_from_spec(spec)
+            old = sys.dont_write_bytecode
+            sys.dont_write_bytecode = True       # keep the package folder clean for uninstall
+            try:
+                spec.loader.exec_module(mod)
+            finally:
+                sys.dont_write_bytecode = old
+            return mod, p
+    return None, None
+
+
+def settings_path():
+    return os.path.join(neptune.theme.STATE, 'ibbs.json')
+
+
+def load_settings():
+    d = {'name': os.environ.get('IBBS_NAME', '%s@%s' % (os.environ.get('USER', 'neptune'),
+                                                        socket.gethostname().split('.')[0])),
+         'server': os.environ.get('IBBS_SERVER', ''), 'token': os.environ.get('IBBS_TOKEN', ''),
+         'board_dir': os.environ.get('IBBS_DIR', ''), 'room': 'general', 'notify': True}
+    try:
+        with open(settings_path()) as f:
+            d.update({k: v for k, v in json.load(f).items() if k in d})
+    except (OSError, ValueError):
+        pass
+    return d
+
+
+def save_settings(d):
+    try:
+        with open(settings_path(), 'w') as f:
+            json.dump(d, f, indent=2)
+    except OSError:
+        pass
+
+
+def author_colour(name):
+    h = sum(ord(c) * (i + 7) for i, c in enumerate(name)) % 360
+    import colorsys
+    r, g, b = colorsys.hls_to_rgb(h / 360.0, 0.35, 0.65)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+class App(neptune.App):
+    title = 'TCF IBBS'
+    icon = 'bbs'
+    size = (860, 580)
+    min_size = (560, 360)
+
+    def __init__(self, shell, **kw):
+        super().__init__(shell, **kw)
+        self.ibbs, self.engine_path = load_engine()
+        self.cfg = load_settings()
+        self.view = 'chat'                       # chat | files | settings
+        self.rooms = [self.cfg['room']]
+        self.room = self.cfg['room']
+        self.messages = []
+        self.offset = 0
+        self.files = []
+        self.status = 'Connecting...'
+        self.ok = False
+        self.scroll = 0                          # rows scrolled up from the bottom
+        self.compose = {'text': '', 'cur': 0}
+        self.newroom = {'text': '', 'cur': 0}
+        self.form = {}
+        self.lock = threading.Lock()
+        self.inbox = []                          # (kind, payload) from the worker
+        self.gen = 0                             # bumps when room / board changes
+        self.stop = False
+        self.ui.focus = 'compose'
+        if self.ibbs is None:
+            self.status = 'ibbs.py not found. Reinstall the IBBS package.'
+        else:
+            self.apply_board()
+            threading.Thread(target=self.worker, daemon=True, name='ibbs-poll').start()
+
+    # -- board ---------------------------------------------------------------------
+    def apply_board(self):
+        c = self.cfg
+        self.ibbs.configure(board_dir=c['board_dir'] or os.path.expanduser('~/.tcf_ibbs'),
+                            server=c['server'], token=c['token'])
+        self.gen += 1
+        self.messages, self.offset, self.scroll = [], 0, 0
+
+    def where(self):
+        c = self.cfg
+        return ('board server %s' % c['server']) if c['server'] else \
+            ('local board %s' % (c['board_dir'] or '~/.tcf_ibbs'))
+
+    def worker(self):
+        last_rooms = 0
+        gen = None
+        offset = 0
+        while not self.stop:
+            try:
+                if gen != self.gen:
+                    gen, room = self.gen, self.room
+                    msgs, offset = self.ibbs.follow(room, 0)
+                    self.push('reset', (gen, msgs[-KEEP:]))
+                else:
+                    msgs, offset2 = self.ibbs.follow(self.room, offset)
+                    if gen == self.gen:
+                        offset = offset2
+                        if msgs:
+                            self.push('new', (gen, msgs))
+                if time.time() - last_rooms > 5:
+                    last_rooms = time.time()
+                    self.push('rooms', self.ibbs.list_rooms())
+                    if self.view == 'files':
+                        self.push('files', self.ibbs.list_files())
+                self.push('ok', None)
+            except Exception as e:                # ConnectionError, OSError, ValueError
+                self.push('err', str(e))
+                time.sleep(2)
+            time.sleep(POLL)
+
+    def push(self, kind, payload):
+        with self.lock:
+            self.inbox.append((kind, payload))
+
+    def background(self, fn, done=None):
+        def run():
+            try:
+                r = fn()
+                self.push('done', (done, r, None))
+            except Exception as e:
+                self.push('done', (done, None, str(e)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_tick(self, now):
+        with self.lock:
+            items, self.inbox = self.inbox, []
+        changed = False
+        for kind, p in items:
+            if kind == 'reset' and p[0] == self.gen:
+                self.messages = p[1]
+                changed = True
+            elif kind == 'new' and p[0] == self.gen:
+                self.messages = (self.messages + p[1])[-KEEP:]
+                theirs = [m for m in p[1] if not self.ibbs.is_mine(m, self.cfg['name'])]
+                if theirs and self.cfg.get('notify') and self.win is not self.shell.active:
+                    m = theirs[-1]
+                    self.shell.notify('IBBS #%s' % self.room, '<%s> %s' % (m.get('from', '?'), m.get('text', '')[:90]),
+                                      'bbs', 5)
+                changed = True
+            elif kind == 'rooms':
+                rooms = sorted(set(p) | {self.room})
+                if rooms != self.rooms:
+                    self.rooms = rooms
+                    changed = True
+            elif kind == 'files':
+                self.files = p
+                changed = True
+            elif kind == 'ok':
+                st = 'Connected to ' + self.where()
+                if st != self.status or not self.ok:
+                    self.status, self.ok = st, True
+                    changed = True
+            elif kind == 'err':
+                self.status, self.ok = p, False
+                changed = True
+            elif kind == 'done':
+                cb, result, err = p
+                if err:
+                    neptune.message(self.shell, 'IBBS', err, 'error', parent=self.win)
+                elif cb:
+                    cb(result)
+                changed = True
+        return changed
+
+    def on_close(self):
+        self.stop = True
+        return True
+
+    # -- actions -----------------------------------------------------------------------
+    def send(self):
+        text = self.compose['text'].strip()
+        if not text or self.ibbs is None:
+            return
+        self.compose = {'text': '', 'cur': 0}
+        if text.startswith('/name '):
+            self.cfg['name'] = text[6:].strip() or self.cfg['name']
+            save_settings(self.cfg)
+            return
+        if text.startswith('/room '):
+            self.switch(text[6:])
+            return
+        room, name = self.room, self.cfg['name']
+        self.scroll = 0
+        self.background(lambda: self.ibbs.post(room, name, text))
+
+    def switch(self, room):
+        try:
+            room = self.ibbs.clean_room(room)
+        except ValueError as e:
+            neptune.message(self.shell, 'IBBS', str(e), 'warning', parent=self.win)
+            return
+        self.room = self.cfg['room'] = room
+        save_settings(self.cfg)
+        if room not in self.rooms:
+            self.rooms = sorted(self.rooms + [room])
+        self.gen += 1
+        self.messages, self.scroll = [], 0
+        self.view = 'chat'
+        self.ui.focus = 'compose'
+
+    def upload(self):
+        def picked(path):
+            room, name = self.room, self.cfg['name']
+            self.shell.notify('IBBS', 'Uploading %s...' % os.path.basename(path), 'bbs', 3)
+            self.background(lambda: self.ibbs.put_file(path, room, name),
+                            lambda info: self.shell.notify('IBBS', 'Shared %s on the board.' % info.get('name', ''),
+                                                           'bbs', 4))
+        self.shell.open_window(neptune.FileDialog(self.shell, 'open', start=neptune.theme.HOME, callback=picked),
+                               parent=self.win)
+
+    def download(self, name):
+        out = os.path.join(neptune.theme.HOME, 'Downloads')
+        os.makedirs(out, exist_ok=True)
+
+        def done(r):
+            dest = r[0]
+            self.shell.notify('IBBS', 'Saved %s (sha256 checked).' % os.path.basename(dest), 'bbs', 5)
+        self.background(lambda: self.ibbs.get_file(name, out, True), done)
+
+    def open_settings(self):
+        c = self.cfg
+        self.form = {k: {'text': str(c[k]), 'cur': len(str(c[k]))} for k in ('name', 'server', 'token', 'board_dir')}
+        self.view = 'settings'
+        self.ui.focus = 'f_name'
+
+    def save_form(self):
+        old = (self.cfg['server'], self.cfg['token'], self.cfg['board_dir'])
+        for k, st in self.form.items():
+            self.cfg[k] = st['text'].strip()
+        save_settings(self.cfg)
+        if (self.cfg['server'], self.cfg['token'], self.cfg['board_dir']) != old:
+            self.apply_board()
+        self.view = 'chat'
+        self.ui.focus = 'compose'
+
+    # -- drawing ----------------------------------------------------------------------------
+    def draw(self, img, ui):
+        gfx = neptune.gfx
+        w, h = img.size
+        # header band
+        img.alpha_composite(gfx.vgradient(w, 52, ((0, (16, 110, 125)), (1, (8, 45, 85)))), (0, 0))
+        img.alpha_composite(neptune.icons.get('bbs', 36), (12, 8))
+        gfx.shadow_text(img, (56, 18), 'TCF IBBS', gfx.font(17, True), (255, 255, 255, 255), (0, 0, 0, 180), anchor='lm')
+        gfx.shadow_text(img, (56, 37), 'Internal Bulletin Board System', gfx.font(11), (190, 235, 240, 255),
+                        (0, 0, 0, 160), anchor='lm')
+        x = w - 8
+        for label, cid in (('Settings', 'settings'), ('Files', 'files'), ('Chat', 'chat')):
+            tw = gfx.text_width(gfx.font(12), label) + 22
+            ui.toolbutton((x - tw, 13, x, 39), label, cid, toggled=self.view == cid, dark=True)
+            x -= tw + 4
+        # room list
+        side = 180
+        ui.panel_gradient((0, 52, side, h - 24), (244, 249, 252), (224, 236, 246))
+        ui.d.line([(side, 52), (side, h - 24)], fill=(180, 200, 215, 255))
+        ui.text((12, 66), 'Rooms', 12, True, color=(30, 57, 91))
+        y = 84
+        for r in self.rooms:
+            if y > h - 80:
+                break
+            ui.listrow((6, y, side - 6, y + 24), ('room', r), r == self.room and self.view == 'chat')
+            ui.text((16, y + 12), '#' + r, 12, anchor='lm')
+            y += 26
+        ui.textbox((8, h - 60, side - 40, h - 36), 'newroom', self.newroom, placeholder='new room')
+        ui.button((side - 36, h - 60, side - 8, h - 36), '+', 'addroom')
+        # main
+        area = (side + 1, 52, w, h - 24)
+        if self.view == 'settings':
+            self.draw_settings(img, ui, area)
+        elif self.view == 'files':
+            self.draw_files(img, ui, area)
+        else:
+            self.draw_chat(img, ui, area)
+        # status bar
+        ui.rect((0, h - 24, w, h), fill=(236, 241, 247))
+        ui.hline(0, w, h - 24, (200, 210, 225))
+        dot = (40, 170, 70) if self.ok else (200, 60, 40)
+        ui.d.ellipse((10, h - 16, 18, h - 8), fill=dot + (255,))
+        ui.text((26, h - 12), gfx.ellipsize(gfx.font(11), self.status, w - 220), 11, color=(50, 60, 80), anchor='lm')
+        ui.text((w - 10, h - 12), 'you are %s' % self.cfg['name'], 11, color=(90, 100, 115), anchor='rm')
+
+    def draw_chat(self, img, ui, area):
+        gfx = neptune.gfx
+        x0, y0, x1, y1 = area
+        ui.text((x0 + 16, y0 + 12), '#' + self.room, 16, color=(0, 51, 153), kind='light')
+        top, bottom = y0 + 40, y1 - 44
+        ui.hline(x0 + 10, x1 - 10, top - 4, (220, 228, 235))
+        fnt, fb = gfx.font(12), gfx.font(12, True)
+        width = x1 - x0 - 60
+        # lay out messages bottom-up
+        blocks = []
+        for m in self.messages:
+            text = m.get('text', '')
+            lines = []
+            for para in text.split('\n'):
+                cur = ''
+                for word in para.split(' '):
+                    t = (cur + ' ' + word) if cur else word
+                    if gfx.text_width(fnt, t) > width - 20 and cur:
+                        lines.append(cur)
+                        cur = word
+                    else:
+                        cur = t
+                lines.append(cur)
+            blocks.append((m, lines))
+        avail = bottom - top
+        heights = [26 + 17 * len(l) for _m, l in blocks]
+        total = sum(heights)
+        self.max_scroll = max(0, total - avail)
+        self.scroll = min(self.scroll, self.max_scroll)
+        y = bottom + self.scroll
+        clip = img.crop((x0, top, x1, bottom))
+        import PIL.ImageDraw as IDraw
+        d = IDraw.Draw(clip)
+        for (m, lines), hgt in zip(reversed(blocks), reversed(heights)):
+            y -= hgt
+            if y + hgt < top or y > bottom:
+                continue
+            ly = y - top
+            mine = self.ibbs.is_mine(m, self.cfg['name'])
+            bx0, bx1 = 16, 16 + width
+            if mine:
+                gfx.round_rect(clip, (bx0 - 6, ly + 2, bx1, ly + hgt - 4), 6, fill=(230, 242, 252, 255),
+                               outline=(184, 214, 241, 255))
+            who = m.get('from', '?')
+            d.text((bx0, ly + 6), who, font=fb, fill=author_colour(who) + (255,))
+            stamp = time.strftime('%H:%M', time.localtime(m.get('time', 0)))
+            host = m.get('host', '')
+            d.text((bx1 - 8, ly + 6), ('%s  %s' % (host, stamp)).strip(), font=gfx.font(10), fill=(130, 140, 150, 255),
+                   anchor='ra')
+            for i, ln in enumerate(lines):
+                col = (0, 90, 60, 255) if ln.startswith('[file]') else (20, 20, 20, 255)
+                d.text((bx0, ly + 24 + i * 17), ln, font=fnt, fill=col)
+        img.paste(clip, (x0, top))
+        if not self.messages:
+            ui.text(((x0 + x1) // 2, (top + bottom) // 2), 'No messages in #%s yet. Say hello!' % self.room, 12,
+                    color=(120, 130, 140), anchor='mm')
+        if self.scroll:
+            ui.button((x1 - 120, bottom - 30, x1 - 16, bottom - 6), 'Newest ↓', 'bottom', size=11)
+        ui.region((x0, top, x1, bottom), 'log', 'log')
+        ui.textbox((x0 + 12, y1 - 36, x1 - 96, y1 - 10), 'compose', self.compose,
+                   placeholder='Message #%s   (/name NEW, /room NAME)' % self.room)
+        ui.button((x1 - 88, y1 - 36, x1 - 12, y1 - 10), 'Send', 'send', default=True)
+
+    def draw_files(self, img, ui, area):
+        gfx = neptune.gfx
+        x0, y0, x1, y1 = area
+        ui.text((x0 + 16, y0 + 12), 'Board files', 16, color=(0, 51, 153), kind='light')
+        ui.button((x1 - 230, y0 + 10, x1 - 120, y0 + 34), 'Share a file...', 'upload', default=True)
+        ui.button((x1 - 112, y0 + 10, x1 - 12, y0 + 34), 'Refresh', 'refresh')
+        y = y0 + 48
+        ui.hline(x0 + 10, x1 - 10, y - 4, (220, 228, 235))
+        if not self.files:
+            ui.text((x0 + 20, y + 10), 'Nothing shared on this board yet.', 12, color=(120, 130, 140))
+        for f in self.files[:40]:
+            if y > y1 - 30:
+                break
+            name = f.get('name', '?')
+            ui.listrow((x0 + 8, y, x1 - 8, y + 26), ('file', name), kind='item', data=name)
+            ui.icon(neptune.icons.for_path(name, False), (x0 + 14, y + 5), 16)
+            ui.text((x0 + 38, y + 13), gfx.ellipsize(gfx.font(12), name, x1 - x0 - 330), 12, anchor='lm')
+            ui.text((x1 - 280, y + 13), self.ibbs.human_size(f.get('size', 0)), 11, color=(110, 110, 110), anchor='lm')
+            ui.text((x1 - 200, y + 13), str(f.get('from', ''))[:22], 11, color=(110, 110, 110), anchor='lm')
+            ui.toolbutton((x1 - 96, y + 2, x1 - 12, y + 24), 'Download', ('get', name), size=11)
+            y += 28
+
+    def draw_settings(self, img, ui, area):
+        x0, y0, x1, y1 = area
+        ui.text((x0 + 16, y0 + 12), 'Board settings', 16, color=(0, 51, 153), kind='light')
+        y = y0 + 52
+        rows = [('name', 'Your name'), ('server', 'Board server'), ('token', 'Token'), ('board_dir', 'Local board folder')]
+        hints = {'server': 'host:port of a machine running  ibbs.py --serve.  Leave empty for a local board.',
+                 'token': 'The shared IBBS_TOKEN, if the board has one.',
+                 'board_dir': 'Used when there is no server. Empty means ~/.tcf_ibbs (same as ibbs.py).'}
+        for k, label in rows:
+            ui.text((x0 + 20, y + 11), label, 12, anchor='lm')
+            ui.textbox((x0 + 160, y, x1 - 24, y + 24), 'f_' + k, self.form[k], password=(k == 'token'))
+            if k in hints:
+                ui.text((x0 + 160, y + 30), hints[k], 11, color=(110, 120, 130))
+                y += 18
+            y += 40
+        ui.checkbox((x0 + 160, y), 'Notify me about new messages when IBBS is in the background', 'notify',
+                    self.cfg.get('notify', True))
+        y += 36
+        ui.text((x0 + 20, y), 'Engine: %s (ibbs.py v%s)' % (self.engine_path or '-', getattr(self.ibbs, 'VERSION', '?')),
+                11, color=(110, 120, 130))
+        ui.button((x1 - 196, y1 - 40, x1 - 104, y1 - 14), 'Save', 'save_form', default=True)
+        ui.button((x1 - 96, y1 - 40, x1 - 16, y1 - 14), 'Cancel', 'chat')
+
+    # -- input --------------------------------------------------------------------------------
+    def on_command(self, cid, data):
+        if cid in ('chat', 'files'):
+            self.view = cid
+            if cid == 'files' and self.ibbs:
+                self.background(self.ibbs.list_files, lambda r: setattr(self, 'files', r))
+            if cid == 'chat':
+                self.ui.focus = 'compose'
+        elif cid == 'settings':
+            self.open_settings()
+        elif cid == 'save_form':
+            self.save_form()
+        elif cid in ('send', 'compose'):
+            self.send()
+        elif cid in ('addroom', 'newroom') and self.newroom['text'].strip():
+            r = self.newroom['text']
+            self.newroom = {'text': '', 'cur': 0}
+            self.switch(r)
+        elif cid == 'bottom':
+            self.scroll = 0
+        elif cid == 'upload':
+            self.upload()
+        elif cid == 'refresh' and self.ibbs:
+            self.background(self.ibbs.list_files, lambda r: setattr(self, 'files', r))
+        elif cid == 'notify':
+            self.cfg['notify'] = bool(data)
+            save_settings(self.cfg)
+        elif isinstance(cid, tuple):
+            if cid[0] == 'room':
+                self.switch(cid[1])
+            elif cid[0] == 'get':
+                self.download(cid[1])
+        elif isinstance(cid, str) and cid.startswith('f_') and data == 'enter':
+            self.save_form()
+
+    def on_activate(self, cid, data):
+        if isinstance(cid, tuple) and cid[0] == 'file':
+            self.download(cid[1])
+        else:
+            self.on_command(cid, data)
+
+    def on_wheel(self, dy, x, y):
+        if self.view == 'chat':
+            self.scroll = int(max(0, min(getattr(self, 'max_scroll', 0), self.scroll + dy * 40)))
+
+    def on_key(self, ev):
+        if ev['key'] == 'escape' and self.view == 'settings':
+            self.view = 'chat'
+            return True
+        if ev['key'] in ('pageup', 'pagedown') and self.view == 'chat':
+            self.scroll = int(max(0, min(getattr(self, 'max_scroll', 0),
+                                         self.scroll + (300 if ev['key'] == 'pageup' else -300))))
+            return True
+        return False
+
+    def wants_caret(self):
+        return True

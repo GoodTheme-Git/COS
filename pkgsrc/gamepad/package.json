@@ -1,0 +1,18 @@
+{
+  "format": "cdi/1",
+  "name": "Gamepad",
+  "title": "COS Gamepad Driver",
+  "version": "1.0",
+  "author": "homemadepc",
+  "description": "Drive COS with a USB gamepad or controller: the D-pad moves through menus and lists, A and B are Enter and Esc, and the left stick moves the pointer.",
+  "requires_cos": "2.4",
+  "readme": "README.txt",
+  "driver": {
+    "module": "gamepad.py",
+    "class": "Driver",
+    "kind": "input",
+    "match": [
+      {"bus": "input", "capability": "gamepad"}
+    ]
+  }
+}

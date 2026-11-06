@@ -1,0 +1,354 @@
+"""Upgrade to COS Neptune: installs COS 3.0 "Neptune" alongside COS v2.4.
+
+COS v2.4 is left exactly as it is and keeps working. Neptune goes into its own
+folder, takes your settings with it, and gets a "COS Neptune" launcher in the
+v2.4 APPS menu. Running the upgrade again updates Neptune's program files and
+never touches Neptune's own home folder (your documents and settings there).
+"""
+import json
+import os
+import shutil
+import sys
+import time
+
+COSAPP = {
+    'name':        'Upgrade to COS Neptune',
+    'icon':        'N',
+    'version':     '3.0',
+    'author':      'TCF (The Coloradan Financial)',
+    'description': 'Installs COS 3.0 "Neptune" (Aero, Graphics Desktop Rendering) next to COS v2.4 and moves your '
+                   'settings over.',
+    'width':       70,
+    'height':      22,
+    'desktop':     True,
+}
+
+PKG_NAME = 'NeptuneUpgrade'
+PROGRAM_ITEMS = ('nep', 'neptune.py', 'assets', 'README.md', 'docs')
+NEEDS = [('PIL', 'Pillow (pictures and fonts)', 'python3-pil', True),
+         ('numpy', 'numpy (fast pixel maths)', 'python3-numpy', True),
+         ('pygame', 'pygame (only for running Neptune in a window)', 'python3-pygame', False)]
+
+
+def payload_dir():
+    return os.path.join(cos.HOME, 'packages', PKG_NAME, 'files', 'neptune')
+
+
+def default_target():
+    if os.path.isfile(os.path.expanduser('~/cos/cos.py')):
+        return os.path.expanduser('~/cos/neptune')
+    return os.path.expanduser('~/neptune')
+
+
+def short(path):
+    home = os.path.expanduser('~')
+    return '~' + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def load_cos_config():
+    try:
+        with open(os.path.expanduser('~/.cos_config')) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def check_system(target):
+    """[(ok, label, detail, required)] -- the Upgrade Advisor."""
+    out = []
+    ok = sys.version_info >= (3, 8)
+    out.append((ok, 'Python %d.%d' % sys.version_info[:2], 'Neptune needs Python 3.8 or newer', True))
+    for mod, label, apt, required in NEEDS:
+        try:
+            __import__(mod)
+            out.append((True, label, '', required))
+        except Exception:
+            out.append((False, label, 'sudo apt install ' + apt, required))
+    gfx = [p for p in ('/dev/dri/card0', '/dev/dri/card1', '/dev/dri/card2', '/dev/fb0') if os.path.exists(p)]
+    out.append((bool(gfx), 'Display for Graphics Desktop Rendering',
+                ', '.join(gfx) if gfx else 'no /dev/dri or /dev/fb0: Neptune can still run in a window', False))
+    try:
+        free = shutil.disk_usage(os.path.dirname(target.rstrip('/')) or '/').free
+    except OSError:
+        free = 0
+    out.append((free > 100 * 1024 * 1024, 'Free disk space', '%d MB free, 100 MB needed' % (free // 1048576), True))
+    out.append((os.path.isdir(payload_dir()), 'Neptune files in this package', payload_dir(), True))
+    return out
+
+
+# -- the upgrade itself (runs on the progress window's thread) ---------------------
+def copy_program(target, p):
+    src = payload_dir()
+    items = [i for i in PROGRAM_ITEMS if os.path.exists(os.path.join(src, i))]
+    os.makedirs(target, exist_ok=True)
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    old = [i for i in items if os.path.exists(os.path.join(target, i))]
+    if old:
+        backup = os.path.join(target, 'backup', 'before-upgrade-' + stamp)
+        os.makedirs(backup, exist_ok=True)
+        for i in old:
+            p.advance(0, 'backing up the old ' + i)
+            shutil.move(os.path.join(target, i), os.path.join(backup, i))
+    for i in items:
+        p.advance(1, 'copying ' + i)
+        s, d = os.path.join(src, i), os.path.join(target, i)
+        if os.path.isdir(s):
+            shutil.copytree(s, d, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        else:
+            shutil.copy2(s, d)
+    for sub in ('home/Documents', 'home/Pictures', 'home/Downloads', 'home/Desktop', 'home/.neptune'):
+        os.makedirs(os.path.join(target, sub), exist_ok=True)
+    return len(items)
+
+
+def migrate(cfg, target, opts):
+    """Carry COS v2.4 settings into Neptune. Never overwrites what Neptune already has."""
+    state = os.path.join(target, 'home', '.neptune')
+    os.makedirs(state, exist_ok=True)
+    notes = []
+    spath = os.path.join(state, 'settings.json')
+    try:
+        with open(spath) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        settings = {}
+    if opts.get('sound') and 'sound_on' in cfg and 'sounds' not in settings:
+        settings['sounds'] = bool(cfg['sound_on'])
+        notes.append('sounds %s' % ('on' if settings['sounds'] else 'off'))
+    pic = os.path.expanduser(cfg.get('wallpaper_image') or '')
+    if opts.get('wallpaper') and pic and os.path.isfile(pic) and not settings.get('wall'):
+        walls = os.path.join(state, 'wallpapers')
+        os.makedirs(walls, exist_ok=True)
+        dest = os.path.join(walls, os.path.basename(pic))
+        shutil.copy2(pic, dest)
+        fit = cfg.get('wallpaper_fit', 'fill')
+        settings['wall'] = {'kind': 'image', 'path': dest, 'fit': fit if fit in ('fill', 'fit', 'stretch') else 'fill',
+                            'bg': '#000000'}
+        notes.append('wallpaper picture')
+    ibbs = os.path.join(state, 'ibbs.json')
+    if opts.get('ibbs') and any(cfg.get(k) for k in ('ibbs_server', 'ibbs_name', 'ibbs_dir')) and not os.path.exists(ibbs):
+        with open(ibbs, 'w') as f:
+            json.dump({'name': cfg.get('ibbs_name', ''), 'server': cfg.get('ibbs_server', ''),
+                       'token': cfg.get('ibbs_token', ''), 'board_dir': cfg.get('ibbs_dir', ''),
+                       'room': cfg.get('ibbs_room') or 'general', 'notify': True}, f, indent=2)
+        notes.append('IBBS board settings')
+    marks = os.path.join(cos.HOME, 'bookmarks.txt')
+    if opts.get('bookmarks') and os.path.isfile(marks):
+        favs = os.path.join(state, 'favorites.txt')
+        have = set()
+        try:
+            with open(favs) as f:
+                have = {ln.rstrip('\n').split('\t', 1)[-1] for ln in f if '\t' in ln}
+        except OSError:
+            pass
+        added = 0
+        with open(marks) as f, open(favs, 'a') as out:
+            for ln in f:
+                url, _, title = ln.rstrip('\n').partition('\t')      # v2.4: url<TAB>title
+                if url.strip() and url not in have:
+                    out.write('%s\t%s\n' % (title.strip() or url, url.strip()))     # Neptune: title<TAB>url
+                    have.add(url)
+                    added += 1
+        if added:
+            notes.append('%d bookmark(s)' % added)
+    if 'oobe_done' not in settings:
+        settings['oobe_done'] = False        # first start: Set Up COS Neptune greets them
+    with open(spath, 'w') as f:
+        json.dump(settings, f, indent=2)
+    return notes
+
+
+def write_launcher(target):
+    path = os.path.join(cos.HOME, 'apps', 'COS_Neptune.cosapp')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write('"""COS launcher for COS 3.0 \\"Neptune\\" (written by Upgrade to COS Neptune)."""\n\n'
+                'COSAPP = {\n'
+                "    'name':        'COS Neptune',\n"
+                "    'icon':        'N',\n"
+                "    'version':     '3.0',\n"
+                "    'author':      'TCF (The Coloradan Financial)',\n"
+                "    'description': 'Starts COS 3.0 \"Neptune\". COS v2.4 comes back when Neptune exits.',\n"
+                "    'kind':        'external',\n"
+                "    'command':     %r,\n"
+                "    'cwd':         %r,\n"
+                "    'graphics':    False,          # Neptune takes the console itself (GDR)\n"
+                "    'desktop':     True,\n"
+                "    'confirm':     'Start COS Neptune now? COS v2.4 comes back when you exit Neptune.',\n"
+                "    'confirm_title': 'COS Neptune',\n"
+                "    'danger':      False,\n"
+                '}\n' % ([sys.executable or 'python3', os.path.join(target, 'neptune.py')], target))
+    return path
+
+
+class App(cos.Window):
+    STEPS = ('welcome', 'check', 'options', 'done')
+
+    def __init__(self, state):
+        super().__init__(COSAPP['name'], COSAPP['width'], COSAPP['height'])
+        self.state = state
+        self.step = 'welcome'
+        self.targets = [default_target()]
+        alt = os.path.expanduser('~/neptune')
+        if alt not in self.targets:
+            self.targets.append(alt)
+        self.target_i = 0
+        self.cfg = load_cos_config()
+        self.opts = {'ibbs': True, 'sound': True, 'wallpaper': True, 'bookmarks': True, 'launcher': True}
+        self.opt_keys = list(self.opts)
+        self.sel = 0
+        self.report = []
+        self.result = None
+        self.checks = []
+
+    @property
+    def target(self):
+        return self.targets[self.target_i]
+
+    def status(self):
+        return {'welcome': 'ENTER continue   Q close',
+                'check': 'ENTER continue   B back   Q close',
+                'options': 'UP/DOWN pick   SPACE toggle   T folder   ENTER upgrade   B back',
+                'done': 'Q close'}[self.step]
+
+    # -- drawing ------------------------------------------------------------------
+    def draw_client(self, c, active):
+        c.fill(cos.cp(cos.CP_WINDOW))
+        title = cos.cp(cos.CP_BRIGHT, bold=True)
+        text = cos.cp(cos.CP_TEXT)
+        dim = cos.cp(cos.CP_SHADOW)
+        good = cos.cp(cos.CP_GREEN, bold=True)
+        bad = cos.cp(cos.CP_WARN, bold=True)
+        n = self.STEPS.index(self.step)
+        c.put(0, 2, 'Step %d of 4' % (n + 1), dim)
+        c.bar(0, 16, max(8, c.w - 20), (n + 1) / 4.0, cos.cp(cos.CP_METER, bold=True), dim)
+        if self.step == 'welcome':
+            c.put(2, 2, 'Upgrade to COS 3.0 "Neptune"', title)
+            lines = ['Neptune is the Aero release of COS: glass windows, a taskbar and',
+                     'Start menu, all drawn pixel by pixel through Graphics Desktop',
+                     'Rendering. It brings Webinator, Druman, Pigeon, packages and a',
+                     'compatibility mode that runs your COS 2.x programs.',
+                     '',
+                     'This is a side-by-side upgrade:',
+                     '  * COS v2.4 stays installed and keeps working.',
+                     '  * Neptune gets its own folder and a launcher in APPS.',
+                     '  * Your settings come along (you choose which).',
+                     '',
+                     'Press ENTER to check this computer.']
+            for i, ln in enumerate(lines):
+                c.put(4 + i, 2, ln, text)
+        elif self.step == 'check':
+            c.put(2, 2, 'Upgrade Advisor', title)
+            row = 4
+            for ok, label, detail, required in self.checks:
+                mark = '[ OK ]' if ok else ('[FAIL]' if required else '[note]')
+                c.put(row, 2, mark, good if ok else (bad if required else dim))
+                c.put(row, 9, label[:c.w - 12], text)
+                if detail and not ok:
+                    row += 1
+                    c.put(row, 11, detail[:c.w - 14], dim)
+                row += 1
+            blockers = [x for x in self.checks if x[3] and not x[0]]
+            row += 1
+            if blockers:
+                c.put(row, 2, 'Fix the [FAIL] items above, then run the upgrade again.', bad)
+            else:
+                c.put(row, 2, 'This computer can run Neptune. Press ENTER to continue.', good)
+        elif self.step == 'options':
+            c.put(2, 2, 'What to bring over', title)
+            labels = {'ibbs': 'IBBS board settings (name, server, token)',
+                      'sound': 'Sound on/off',
+                      'wallpaper': 'Wallpaper picture',
+                      'bookmarks': 'Web bookmarks (into Webinator favourites)',
+                      'launcher': 'Add "COS Neptune" to the v2.4 APPS menu'}
+            for i, k in enumerate(self.opt_keys):
+                box = '[x]' if self.opts[k] else '[ ]'
+                attr = cos.cp(cos.CP_SEL, bold=True) if i == self.sel else text
+                c.put(4 + i, 2, ' %s %s ' % (box, labels[k]), attr)
+            c.put(11, 2, 'Install Neptune into:', text)
+            c.put(12, 4, short(self.target)[:c.w - 8], title)
+            c.put(13, 4, ('(T switches between %s)' % ' and '.join(short(t) for t in self.targets))[:c.w - 6], dim)
+            if os.path.isfile(os.path.join(self.target, 'neptune.py')):
+                c.put(15, 2, 'Neptune is already there: its program files will be updated', dim)
+                c.put(16, 2, '(the old ones go to backup/) and its home folder is kept.', dim)
+            c.put(18, 2, 'Press ENTER to upgrade.', good)
+        elif self.step == 'done':
+            ok = self.result and not self.result.get('error')
+            c.put(2, 2, 'Neptune is installed.' if ok else 'The upgrade did not finish.', good if ok else bad)
+            row = 4
+            for ln in self.report:
+                c.put(row, 2, ln[:c.w - 4], text)
+                row += 1
+            if ok:
+                row += 1
+                c.put(row, 2, 'Start it from APPS > COS Neptune (or the desktop icon).', title)
+                c.put(row + 1, 2, 'From a console:  python3 ' + os.path.join(self.target, 'neptune.py'), dim)
+                c.put(row + 2, 2, 'COS v2.4 is still here whenever you want it.', dim)
+
+    # -- keys ---------------------------------------------------------------------------
+    def on_key(self, key):
+        if key in (ord('q'), ord('Q')) and self.step != 'options':
+            if self.wm:
+                self.wm.close(self)
+            return True
+        if self.step == 'welcome' and key in (10, 13, curses.KEY_ENTER):
+            self.checks = check_system(self.target)
+            self.step = 'check'
+            return True
+        if key in (ord('b'), ord('B')):
+            self.step = {'check': 'welcome', 'options': 'check'}.get(self.step, self.step)
+            return True
+        if self.step == 'check' and key in (10, 13, curses.KEY_ENTER):
+            if any(x[3] and not x[0] for x in self.checks):
+                self.warn('Not yet', 'Some things Neptune needs are missing.\nThe Upgrade Advisor shows how to '
+                                     'install them.')
+            else:
+                self.step = 'options'
+            return True
+        if self.step == 'options':
+            if key == curses.KEY_UP:
+                self.sel = (self.sel - 1) % len(self.opt_keys)
+            elif key == curses.KEY_DOWN:
+                self.sel = (self.sel + 1) % len(self.opt_keys)
+            elif key == ord(' '):
+                k = self.opt_keys[self.sel]
+                self.opts[k] = not self.opts[k]
+            elif key in (ord('t'), ord('T')):
+                self.target_i = (self.target_i + 1) % len(self.targets)
+            elif key in (ord('q'), ord('Q')):
+                if self.wm:
+                    self.wm.close(self)
+            elif key in (10, 13, curses.KEY_ENTER):
+                self.start()
+            return True
+        return False
+
+    def start(self):
+        target, opts, cfg = self.target, dict(self.opts), self.cfg
+
+        def work(p):
+            report = []
+            try:
+                n = copy_program(target, p)
+                report.append('Copied Neptune (%d parts) to %s' % (n, target))
+                p.advance(1, 'moving your settings')
+                notes = migrate(cfg, target, opts)
+                report.append('Settings brought over: ' + (', '.join(notes) if notes else 'none needed'))
+                if opts.get('launcher'):
+                    p.advance(1, 'adding the launcher')
+                    report.append('Launcher: ' + write_launcher(target))
+                return {'report': report}
+            except Exception as e:
+                return {'report': report, 'error': '%s: %s' % (type(e).__name__, e)}
+
+        def done(win):
+            self.result = getattr(win, 'result', None) or {'error': 'cancelled', 'report': []}
+            self.report = list(self.result.get('report', []))
+            if self.result.get('error'):
+                self.report.append('Error: ' + self.result['error'])
+            self.step = 'done'
+            self.play('notify')
+
+        self.progress('Upgrading to COS Neptune', 'starting...', total=len(PROGRAM_ITEMS) + 2, worker=work,
+                      cancellable=False, on_done=done)

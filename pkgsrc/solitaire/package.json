@@ -1,0 +1,11 @@
+{
+  "format": "cip/1",
+  "name": "Solitaire",
+  "title": "COS Solitaire",
+  "version": "0.1",
+  "author": "you",
+  "description": "Klondike solitaire for COS.",
+  "requires_cos": "2.4",
+  "readme": "README.txt",
+  "apps": ["Solitaire.cosapp"]
+}

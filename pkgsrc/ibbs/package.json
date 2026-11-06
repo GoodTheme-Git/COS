@@ -1,0 +1,11 @@
+{
+  "format": "cip/1",
+  "name": "IBBS",
+  "title": "TCF IBBS",
+  "version": "1.0",
+  "author": "TCF (The Coloradan Financial)",
+  "description": "The TCF Internal Bulletin Board System for COS Neptune: chat rooms and shared files, on this machine or through an IBBS board server.",
+  "requires_cos": "3.0",
+  "readme": "README.txt",
+  "apps": ["IBBS.nepapp"]
+}

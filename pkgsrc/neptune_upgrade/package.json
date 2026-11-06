@@ -1,0 +1,11 @@
+{
+  "format": "cip/1",
+  "name": "NeptuneUpgrade",
+  "title": "Upgrade to COS 3.0 \"Neptune\"",
+  "version": "3.0",
+  "author": "TCF (The Coloradan Financial)",
+  "description": "Installs COS 3.0 \"Neptune\" (Aero, Graphics Desktop Rendering) next to COS v2.4, moves your settings over, and adds a COS Neptune launcher to APPS. COS v2.4 keeps working.",
+  "requires_cos": "2.4",
+  "readme": "README.txt",
+  "apps": ["NeptuneUpgrade.cosapp"]
+}

@@ -1,0 +1,12 @@
+{
+  "format": "cip/1",
+  "name": "COS_Invent",
+  "title": "COS Solitaire",
+  "version": "0.1",
+  "author": "The Coloradan Financial",
+  "description": "TCF COS Invent Software.",
+  "requires_cos": "2.4",
+  "readme": "README.txt",
+  "licence": "licence.txt",
+  "apps": ["main.cosapp"]
+}

@@ -1,0 +1,74 @@
+"""TCF COS Invent(TM)
+
+Try it without packaging:  copy this file to ~/.cos/apps/ and open it from
+APPS (press R in the App Manager to reload after each edit).
+Package it:                python3 cos.py --make-package pkgsrc/solitaire
+"""
+import random
+
+COSAPP = {
+    'name':        'COS Invent(TM)',
+    'icon':        'INV',
+    'version':     '0.1',
+    'author':      'The Colo Finance',
+    'description': 'So it be the COS Invent thing.',
+    'width':       70,
+    'height':      24,
+    'desktop':     True,
+}
+# variables yaaaaaaaaaaaaa
+SUITS = 'SHDC'          # spades, hearts, diamonds, clubs
+RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
+
+
+class App(cos.Window):
+    def __init__(self, state):
+        super().__init__(COSAPP['name'], COSAPP['width'], COSAPP['height'])
+        self.state = state
+        self.new_game()
+
+    def new_game(self):
+        # TODO: make the 52 cards and shuffle them (random.shuffle).
+        #       Then deal: 7 tableau piles with 1..7 cards (only the top one
+        #       face up), and the rest in the stock.
+        # TODO: you'll also want the waste pile and 4 foundations.
+        pass
+
+    def status(self):
+        return 'N new   Q close'
+
+    def draw_client(self, c, active):
+        # c.put(row, col, text, colour). Rows and columns are character cells.
+        c.fill(cos.cp(cos.CP_WINDOW))
+        c.put(1, 2, 'Solitaire -- your game goes here!',
+              cos.cp(cos.CP_BRIGHT, bold=True))
+        # one sample card, so you can see how a card could look
+        self.draw_card(c, 3, 2, 'Q', 'H', face_up=True)
+        self.draw_card(c, 3, 10, None, None, face_up=False)
+
+    def draw_card(self, c, row, col, rank, suit, face_up):
+        """A card 6 wide and 4 tall."""
+        if not face_up:
+            for r in range(4):
+                c.put(row + r, col, '######', cos.cp(cos.CP_ACCENT))
+            return
+        red = suit in 'HD'
+        colour = cos.cp(cos.CP_WARN if red else cos.CP_TEXT, bold=True)
+        c.put(row,     col, '+----+', cos.cp(cos.CP_TEXT))
+        c.put(row + 1, col, '|%-2s%s |' % (rank, suit), colour)
+        c.put(row + 2, col, '|    |', cos.cp(cos.CP_TEXT))
+        c.put(row + 3, col, '+----+', cos.cp(cos.CP_TEXT))
+
+    def on_key(self, key):
+        # return True when you used the key, False to let COS have it
+        if key in (ord('n'), ord('N')):
+            self.new_game()
+            return True
+        # TODO: arrow keys (cos.curses.KEY_LEFT ...) to pick a pile,
+        #       ENTER to pick up / put down cards.
+        return False
+
+    def on_click(self, row, col, btn):
+        # row/col are inside the window, same as draw_client's
+        # TODO: work out which pile (and which card) is at row, col
+        return False

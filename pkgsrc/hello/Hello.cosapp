@@ -1,0 +1,35 @@
+"""Hello COS: the sample app shipped in Hello.cip."""
+import os
+
+COSAPP = {
+    'name':        'Hello',
+    'icon':        'H',
+    'version':     '1.0',
+    'author':      'homemadepc',
+    'description': 'Sample app from a .cip package.',
+    'width':       62,
+    'height':      12,
+    'desktop':     False,
+}
+
+# files a .cip ships besides its apps land here
+DATA = os.path.join(cos.HOME, 'packages', 'Hello', 'files', 'greetings.txt')
+
+
+class App(cos.Window):
+    def __init__(self, state):
+        super().__init__(COSAPP['name'], COSAPP['width'], COSAPP['height'])
+        try:
+            with open(DATA) as f:
+                self.lines = f.read().splitlines()
+        except OSError as e:
+            self.lines = ['(could not read %s: %s)' % (DATA, e.strerror)]
+
+    def status(self):
+        return 'Q closes'
+
+    def draw_client(self, c, active):
+        c.fill(cos.cp(cos.CP_WINDOW))
+        for i, line in enumerate(self.lines):
+            c.put(1 + i, 2, line, cos.cp(cos.CP_BRIGHT if i == 0 else cos.CP_TEXT,
+                                         bold=(i == 0)))

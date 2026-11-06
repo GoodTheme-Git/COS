@@ -1,0 +1,11 @@
+{
+  "format": "cip/1",
+  "name": "Hello",
+  "title": "Hello COS",
+  "version": "1.0",
+  "author": "homemadepc",
+  "description": "A sample program package: one app, plus a data file it reads from its package folder.",
+  "requires_cos": "2.4",
+  "readme": "README.txt",
+  "apps": ["Hello.cosapp"]
+}

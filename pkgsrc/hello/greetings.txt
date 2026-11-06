@@ -1,0 +1,3 @@
+Hello from a COS Installer Package!
+This line was read from ~/.cos/packages/Hello/files/greetings.txt,
+which the installer put there.
