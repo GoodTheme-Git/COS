@@ -1,0 +1,165 @@
+#!/bin/bash
+# COS hard disk installer. Runs on tty1 when the live USB is booted with the
+# "Install COS to the hard disk" menu entry (kernel option cos.install).
+#
+# It erases ONE disk the user picks and types the name of, then lays down:
+#   MBR partition table   -- what a 2006 BIOS expects
+#     1: 256 MB FAT32 EFI system partition
+#     2: the rest, ext4, the COS system (with a swap file)
+#   GRUB for BIOS (in the MBR) AND for EFI (removable path on the ESP), so the
+#   disk boots on either kind of firmware.
+# The live USB it booted from is never offered and cannot be chosen.
+set -u
+export TERM=linux NEWT_COLORS='root=white,blue window=black,lightgray border=black,lightgray title=white,blue button=black,cyan actbutton=white,blue'
+TITLE="COS Setup -- install to hard disk"
+MNT=/mnt/cos-target
+SQUASH=/run/live/medium/live/filesystem.squashfs
+
+die() {
+    whiptail --title "$TITLE" --msgbox "Setup cannot continue:\n\n$1\n\nNothing more will be changed. Press ENTER to restart the computer." 14 70
+    cleanup
+    systemctl reboot
+    exit 1
+}
+
+cleanup() {
+    for m in run sys proc dev/pts dev boot/efi ""; do
+        mountpoint -q "$MNT/$m" 2>/dev/null && umount -l "$MNT/$m"
+    done
+}
+
+[ "$(id -u)" = 0 ] || { echo "cos-install must run as root (sudo cos-install)"; exit 1; }
+[ -f "$SQUASH" ] || die "This only works when booted from the COS USB stick\n($SQUASH is missing)."
+
+whiptail --title "$TITLE" --yes-button "Next >" --no-button "Cancel" --yesno \
+"Welcome to COS Setup.\n\nThis will install COS onto this computer's hard disk so it starts without the USB stick.\n\nTHE DISK YOU CHOOSE WILL BE ERASED. Everything on it -- Windows, files, everything -- will be gone.\n\nChoose Cancel to restart instead." 16 70 \
+    || { systemctl reboot; exit 0; }
+
+# -- which disk ---------------------------------------------------------------
+live_part=$(findmnt -n -o SOURCE /run/live/medium 2>/dev/null)
+live_disk=""
+[ -n "$live_part" ] && live_disk="/dev/$(lsblk -no PKNAME "$live_part" 2>/dev/null | head -1)"
+
+menu=()
+while read -r name size type rm model; do
+    [ "$type" = disk ] || continue
+    [ "$name" = "$live_disk" ] && continue
+    bytes=$(lsblk -bdno SIZE "$name")
+    [ "$bytes" -ge $((4 * 1024 * 1024 * 1024)) ] || continue
+    label="$size  ${model:-disk}"
+    [ "$rm" = 1 ] && label="$label (removable)"
+    menu+=("$name" "$label")
+done < <(lsblk -dpno NAME,SIZE,TYPE,RM,MODEL | grep -v '^/dev/loop')
+
+[ ${#menu[@]} -gt 0 ] || die "No hard disk of 4 GB or more was found.\n(The USB stick COS is running from is never offered.)"
+
+disk=$(whiptail --title "$TITLE" --menu "Choose the disk to install COS on.\nIt will be ERASED." 16 70 6 "${menu[@]}" 3>&1 1>&2 2>&3) \
+    || { systemctl reboot; exit 0; }
+short=$(basename "$disk")
+
+typed=$(whiptail --title "$TITLE" --inputbox \
+"Last chance. Everything on $disk will be erased:\n\n$(lsblk -no NAME,SIZE,FSTYPE,LABEL "$disk")\n\nType $short to confirm:" 20 70 3>&1 1>&2 2>&3) \
+    || { systemctl reboot; exit 0; }
+[ "$typed" = "$short" ] || die "You typed '$typed', not '$short', so nothing was erased."
+
+pw=""
+while true; do
+    p1=$(whiptail --title "$TITLE" --passwordbox "Choose a password for the 'cos' account (used for sudo and the\nfirst-boot login screen if you turn it on). Leave empty for none." 11 70 3>&1 1>&2 2>&3) || p1=""
+    [ -z "$p1" ] && break
+    p2=$(whiptail --title "$TITLE" --passwordbox "Type the password again:" 9 70 3>&1 1>&2 2>&3) || p2=""
+    [ "$p1" = "$p2" ] && { pw="$p1"; break; }
+    whiptail --title "$TITLE" --msgbox "The two passwords did not match. Try again." 8 50
+done
+
+# -- partition, format, copy ---------------------------------------------------
+step() { echo "XXX"; echo "$1"; echo "$2"; echo "XXX"; }
+(
+    step 2 "Unmounting anything on $disk..."
+    for p in $(lsblk -lnpo NAME "$disk" | tail -n +2); do umount -l "$p" 2>/dev/null; swapoff "$p" 2>/dev/null; done
+    step 5 "Writing a new partition table on $disk..."
+    wipefs -af "$disk" >/dev/null 2>&1
+    parted -s "$disk" mklabel msdos \
+        mkpart primary fat32 1MiB 257MiB set 1 esp on \
+        mkpart primary ext4 257MiB 100% set 2 boot on || exit 11
+    partprobe "$disk"; udevadm settle; sleep 1
+    parts=($(lsblk -lnpo NAME "$disk" | tail -n +2))
+    esp=${parts[0]}; root=${parts[1]}
+    echo "$esp $root" > /run/cos-install.parts
+    step 8 "Formatting..."
+    mkfs.vfat -F 32 -n COSEFI "$esp" >/dev/null 2>&1 || exit 12
+    mkfs.ext4 -q -F -L COS "$root" >/dev/null 2>&1 || exit 13
+    mkdir -p "$MNT"; mount "$root" "$MNT" || exit 14
+    mkdir -p "$MNT/boot/efi"; mount "$esp" "$MNT/boot/efi" || exit 15
+    step 10 "Copying COS onto the disk..."
+    # Debian 12's unsquashfs (4.5) has no -percentage, so progress is how
+    # much of the target is filled against the system's unpacked size,
+    # which the build records in live/filesystem.size.
+    total=$(cat "$(dirname "$SQUASH")/filesystem.size" 2>/dev/null || echo 0)
+    base=$(df --output=used -B1 "$MNT" | tail -1)
+    unsquashfs -f -no-progress -d "$MNT" "$SQUASH" >/tmp/cos-unsquash.log 2>&1 &
+    upid=$!
+    while kill -0 "$upid" 2>/dev/null; do
+        sleep 2
+        if [ "$total" -gt 0 ]; then
+            used=$(( $(df --output=used -B1 "$MNT" | tail -1) - base ))
+            pct=$(( used * 100 / total )); [ "$pct" -gt 99 ] && pct=99
+            step $((10 + pct * 70 / 100)) "Copying COS onto the disk... $pct%"
+        fi
+    done
+    wait "$upid" || exit 17
+    [ -x "$MNT/usr/bin/python3" ] || exit 16
+    step 82 "Making a swap file..."
+    dd if=/dev/zero of="$MNT/swapfile" bs=1M count=512 status=none && chmod 600 "$MNT/swapfile" \
+        && mkswap "$MNT/swapfile" >/dev/null
+    exit 0
+) | whiptail --title "$TITLE" --gauge "Starting..." 8 70 0
+rc=${PIPESTATUS[0]}
+[ "$rc" = 0 ] || die "Partitioning or copying failed (code $rc) on $disk.\n$(tail -3 /tmp/cos-unsquash.log 2>/dev/null)"
+read -r esp root < /run/cos-install.parts
+
+# -- make it bootable -----------------------------------------------------------
+cat > "$MNT/etc/fstab" <<FSTAB
+UUID=$(blkid -s UUID -o value "$root")  /          ext4  errors=remount-ro  0 1
+UUID=$(blkid -s UUID -o value "$esp")  /boot/efi  vfat  umask=0077         0 1
+/swapfile  none  swap  sw  0 0
+FSTAB
+for m in dev dev/pts proc sys run; do mount --bind "/$m" "$MNT/$m"; done
+
+# One kernel is enough on a real disk: the 64-bit one if the CPU can run it.
+if grep -qw lm /proc/cpuinfo; then drop='linux-image-*686*'; else drop='linux-image-*amd64*'; fi
+pw_line=""
+[ -n "$pw" ] && pw_line="cos:$pw"
+(
+    echo 85; echo "XXX"; echo 85; echo "Setting up the system..."; echo "XXX"
+    chroot "$MNT" /bin/bash -c "
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get purge -y -q live-boot live-boot-initramfs-tools \$(dpkg-query -W -f='\${binary:Package} ' '$drop') >/dev/null 2>&1
+        rm -f /etc/systemd/system/multi-user.target.wants/cos-installer.service
+        rm -f /home/cos/.cos_config        # first boot from disk runs COS Setup
+        update-initramfs -u -k all >/dev/null 2>&1
+    "
+    echo 92; echo "XXX"; echo 92; echo "Installing the boot loader..."; echo "XXX"
+    # written outright: only the full grub-pc/grub-efi packages create this
+    # file, and the image carries the -bin ones
+    cat > "$MNT/etc/default/grub" <<'GRUBDEF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=2
+GRUB_DISTRIBUTOR=COS
+GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3"
+GRUB_CMDLINE_LINUX=""
+GRUB_DISABLE_OS_PROBER=true
+GRUBDEF
+    chroot "$MNT" grub-install --target=i386-pc "$disk" >/dev/null 2>&1 || exit 21
+    chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram >/dev/null 2>&1 || exit 22
+    chroot "$MNT" grub-install --target=i386-efi --efi-directory=/boot/efi --removable --no-nvram >/dev/null 2>&1 || true
+    chroot "$MNT" update-grub >/dev/null 2>&1 || exit 23
+    exit 0
+) | whiptail --title "$TITLE" --gauge "Setting up..." 8 70 85
+rc=${PIPESTATUS[0]}
+[ "$rc" = 0 ] || die "Installing the boot loader failed (code $rc)."
+[ -n "$pw_line" ] && echo "$pw_line" | chroot "$MNT" chpasswd
+
+cleanup
+sync
+whiptail --title "$TITLE" --msgbox "COS is installed on $disk.\n\nRemove the USB stick, then press ENTER to restart. The first start from the hard disk runs COS Setup, then COS." 12 70
+systemctl reboot
